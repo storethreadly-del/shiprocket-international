@@ -377,19 +377,22 @@ class TIS_API {
      */
     protected static function describe_row($row) {
 
-        $desc = ['keys' => implode(',', array_keys($row))];
+        // Dump every field, preserving type. An earlier version only reported
+        // scalars, which silently hid the single most important fact: `rate`
+        // exists but is null, so there was no charge to find anywhere.
+        $desc = [];
 
-        foreach (['courier_name', 'courier_company_id', 'rate', 'is_international'] as $k) {
-            if (array_key_exists($k, $row) && is_scalar($row[$k])) {
-                $desc[$k] = (string) $row[$k];
-            }
-        }
-
-        foreach (['tariff_data', 'weight_cases', 'tariff', 'rate_data'] as $k) {
-            if (isset($row[$k])) {
-                $desc[$k] = is_array($row[$k])
-                    ? substr((string) wp_json_encode($row[$k]), 0, 400)
-                    : (string) $row[$k];
+        foreach ($row as $k => $v) {
+            if (null === $v) {
+                $desc[$k] = 'NULL';
+            } elseif (is_bool($v)) {
+                $desc[$k] = $v ? 'true' : 'false';
+            } elseif (is_scalar($v)) {
+                $desc[$k] = $v;
+            } elseif (is_array($v)) {
+                $desc[$k] = empty($v) ? 'EMPTY_ARRAY' : 'array:' . substr((string) wp_json_encode($v), 0, 300);
+            } else {
+                $desc[$k] = gettype($v);
             }
         }
 

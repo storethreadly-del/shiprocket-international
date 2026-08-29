@@ -123,6 +123,34 @@ add_action('plugins_loaded', function () {
         require_once TIS_PATH . 'includes/settings-page.php';
     }
 
+    // Shiprocket has blocked the API user. Surface this on every admin screen:
+    // the symptom an admin actually notices is "international rates stopped
+    // appearing", and without this they have no way to connect that to a
+    // lockout that resolves itself on a timer.
+    add_action('admin_notices', function () {
+
+        if (!current_user_can('manage_woocommerce')) {
+            return;
+        }
+
+        $remaining = TIS_Auth::blocked_for();
+        if ($remaining <= 0) {
+            return;
+        }
+
+        echo '<div class="notice notice-warning"><p><strong>Threadly International Shipping:</strong> '
+            . esc_html__('Shiprocket has temporarily blocked this API user after repeated failed logins. Login attempts are paused automatically, and checkout is serving your fallback rate meanwhile.', 'threadly-intl-shipping')
+            . ' ' . sprintf(
+                /* translators: %s: minutes remaining */
+                esc_html__('Retrying in about %s minute(s).', 'threadly-intl-shipping'),
+                esc_html((string) max(1, (int) ceil($remaining / MINUTE_IN_SECONDS)))
+            )
+            . ' <a href="' . esc_url(admin_url('admin.php?page=tis-settings')) . '">'
+            . esc_html__('View details', 'threadly-intl-shipping') . '</a>'
+            . '</p><p><em>' . esc_html__('If this keeps happening, check that no other integration (for example HIBOU) is using the same Shiprocket API user — the lockout applies per API user.', 'threadly-intl-shipping')
+            . '</em></p></div>';
+    });
+
     if (!TIS_Auth::has_credentials()) {
         add_action('admin_notices', function () {
             if (!current_user_can('manage_woocommerce')) {

@@ -196,8 +196,30 @@ class TIS_Auth {
             $body = json_decode(wp_remote_retrieve_body($response), true);
 
             if ($code < 200 || $code >= 300 || empty($body['token'])) {
-                self::record_failure();
+
                 $msg = is_array($body) && !empty($body['message']) ? $body['message'] : 'HTTP ' . $code;
+
+                // Shiprocket enforces its own per-API-user lockout and answers
+                // 403 "User blocked due to too many failed login attempts".
+                // Treat that as authoritative and stop immediately: counting to
+                // MAX_FAILS first would mean two more pointless attempts
+                // against an account we have already been told is blocked,
+                // which can extend the block rather than let it expire.
+                if (self::looks_blocked($code, $msg)) {
+                    $minutes = (int) apply_filters('tis_server_block_minutes', 15);
+                    self::force_block($minutes);
+                    tis_log('error', 'Shiprocket has blocked this API user. Pausing all login attempts.', [
+                        'http_code'      => $code,
+                        'message'        => $msg,
+                        'paused_minutes' => $minutes,
+                    ]);
+                    return [
+                        'code'  => 'locked',
+                        'error' => 'Shiprocket has temporarily blocked this API user after repeated failed logins.',
+                    ];
+                }
+
+                self::record_failure();
                 tis_log('error', 'Shiprocket rejected authentication.', ['http_code' => $code, 'message' => $msg]);
                 // 4xx means the credentials themselves were refused; 5xx means
                 // Shiprocket is having trouble. The admin needs to be told
@@ -276,6 +298,35 @@ class TIS_Auth {
         global $wpdb;
 
         $wpdb->delete($wpdb->options, ['option_name' => self::LOCK_KEY], ['%s']);
+    }
+
+    /**
+     * Does this response mean Shiprocket has blocked the API user itself?
+     *
+     * Matched on the message rather than the status code alone: 403 is also
+     * used for ordinary permission problems, and only the "blocked" wording
+     * indicates the lockout.
+     */
+    protected static function looks_blocked($code, $message) {
+        return (403 === (int) $code && preg_match('/block|too many|locked/i', (string) $message));
+    }
+
+    /**
+     * Pause all login attempts for a fixed period, regardless of the local
+     * failure count. Used when Shiprocket reports its own lockout.
+     */
+    public static function force_block($minutes) {
+        $minutes = max(1, (int) $minutes);
+        set_transient(self::BLOCK_KEY, time() + ($minutes * MINUTE_IN_SECONDS), $minutes * MINUTE_IN_SECONDS);
+        set_transient(self::FAIL_KEY, self::MAX_FAILS, $minutes * MINUTE_IN_SECONDS);
+    }
+
+    /**
+     * Seconds remaining on the login pause, or 0 if not paused.
+     */
+    public static function blocked_for() {
+        $until = (int) get_transient(self::BLOCK_KEY);
+        return $until > time() ? ($until - time()) : 0;
     }
 
     protected static function record_failure() {

@@ -54,6 +54,14 @@ function tis_describe_rate_response($result) {
             $shape['api_message'] = (string) $raw['message'];
         }
 
+        // The response carries currency at the top level, not per courier.
+        if (isset($raw['currency']) && is_scalar($raw['currency'])) {
+            $shape['response_currency'] = (string) $raw['currency'];
+        }
+        if (isset($raw['status']) && is_scalar($raw['status'])) {
+            $shape['api_status'] = (string) $raw['status'];
+        }
+
         // Locate whichever envelope the courier list actually arrived in.
         foreach ([['data', 'available_courier_companies'], ['available_courier_companies'], ['data']] as $path) {
             $cur = $raw;
@@ -104,10 +112,15 @@ function tis_run_connection_test() {
 
         $code = $token['code'] ?? 'transport';
 
-        // 'locked' is a consequence of rejected credentials, so it is reported
-        // as an authentication problem — that is what the admin must act on.
-        $state = in_array($code, ['auth_rejected', 'locked'], true) ? 'auth_failed'
-               : ('no_credentials' === $code ? 'missing' : 'unavailable');
+        // 'locked' is reported in its own right rather than folded into a
+        // generic auth failure: the admin's action is to wait, not to go
+        // re-check a password that may be perfectly correct.
+        $map   = [
+            'locked'         => 'locked',
+            'auth_rejected'  => 'auth_failed',
+            'no_credentials' => 'missing',
+        ];
+        $state = $map[$code] ?? 'unavailable';
 
         tis_log('error', 'Connection test failed during authentication.', [
             'state'  => $state,
@@ -274,6 +287,9 @@ function tis_state_message($state) {
     switch ($state) {
         case 'connected':
             return esc_html__('✅ Shiprocket connection successful.', 'threadly-intl-shipping');
+        case 'locked':
+            return esc_html__('⏳ Shiprocket has temporarily blocked this API user after repeated failed logins. Logins are paused automatically — no action needed except to wait.', 'threadly-intl-shipping')
+                . ' ' . tis_countdown_html();
         case 'auth_failed':
             return esc_html__('❌ Unable to connect to Shiprocket. Check your credentials or try again.', 'threadly-intl-shipping');
         case 'missing':
@@ -281,6 +297,48 @@ function tis_state_message($state) {
         default:
             return esc_html__('Shiprocket is temporarily unavailable. Checkout will use your fallback rate until it recovers.', 'threadly-intl-shipping');
     }
+}
+
+/**
+ * Live countdown to when logins resume.
+ *
+ * Rendered from the server-side remaining seconds and ticked down in the
+ * browser, so the admin sees time actually elapsing rather than a static
+ * number that is stale the moment the page renders.
+ */
+function tis_countdown_html() {
+
+    $remaining = TIS_Auth::blocked_for();
+
+    if ($remaining <= 0) {
+        return '<strong>' . esc_html__('You can try again now.', 'threadly-intl-shipping') . '</strong>';
+    }
+
+    $id = 'tis-countdown-' . wp_rand(1000, 9999);
+
+    ob_start();
+    ?><strong><?php esc_html_e('Retrying in', 'threadly-intl-shipping'); ?>
+    <span id="<?php echo esc_attr($id); ?>" data-remaining="<?php echo esc_attr($remaining); ?>"><?php
+        echo esc_html(sprintf('%02d:%02d', intdiv($remaining, 60), $remaining % 60));
+    ?></span></strong>
+    <script>
+    (function () {
+        var el = document.getElementById(<?php echo wp_json_encode($id); ?>);
+        if (!el) { return; }
+        var left = parseInt(el.getAttribute('data-remaining'), 10) || 0;
+        var tick = setInterval(function () {
+            left -= 1;
+            if (left <= 0) {
+                clearInterval(tick);
+                el.textContent = <?php echo wp_json_encode(__('now — reload to retry', 'threadly-intl-shipping')); ?>;
+                return;
+            }
+            var m = Math.floor(left / 60), s = left % 60;
+            el.textContent = (m < 10 ? '0' : '') + m + ':' + (s < 10 ? '0' : '') + s;
+        }, 1000);
+    })();
+    </script><?php
+    return ob_get_clean();
 }
 
 /**
@@ -292,7 +350,7 @@ function tis_current_state($status) {
         return 'missing';
     }
     if ($status['blocked_for'] > 0) {
-        return 'auth_failed';
+        return 'locked';
     }
     if (TIS_API::circuit_is_open()) {
         return 'unavailable';
@@ -360,6 +418,7 @@ function tis_render_settings_page() {
     $dots = [
         'connected'   => '🟢',
         'auth_failed' => '🔴',
+        'locked'      => '⏳',
         'unavailable' => '🟠',
         'missing'     => '⚪',
         'untested'    => '⚪',

@@ -94,7 +94,7 @@ class TIS_Auth {
 
         $blocked_until = (int) get_transient(self::BLOCK_KEY);
         if ($blocked_until > time()) {
-            return ['error' => sprintf(
+            return ['code' => 'locked', 'error' => sprintf(
                 'Shiprocket login paused after %d consecutive failures. Retrying in %d minute(s). Check the API user credentials.',
                 self::MAX_FAILS,
                 (int) ceil(($blocked_until - time()) / MINUTE_IN_SECONDS)
@@ -118,7 +118,7 @@ class TIS_Auth {
 
         $blocked_until = (int) get_transient(self::BLOCK_KEY);
         if ($blocked_until > time()) {
-            return ['error' => sprintf(
+            return ['code' => 'locked', 'error' => sprintf(
                 'Shiprocket login is currently locked out after repeated failures. Retrying automatically in %d minute(s).',
                 (int) ceil(($blocked_until - time()) / MINUTE_IN_SECONDS)
             )];
@@ -147,7 +147,7 @@ class TIS_Auth {
         $creds = self::credentials();
 
         if ('' === trim($creds['email']) || '' === trim($creds['password'])) {
-            return ['error' => 'No Shiprocket API user configured for this plugin. Add one under WooCommerce > Intl Shipping.'];
+            return ['code' => 'no_credentials', 'error' => 'No Shiprocket API user configured for this plugin. Add one under WooCommerce > Intl Shipping.'];
         }
 
         if (!$force) {
@@ -166,7 +166,7 @@ class TIS_Auth {
                 return $existing;
             }
             tis_log('notice', 'Skipped Shiprocket login — another attempt was already in progress.');
-            return ['error' => 'Another Shiprocket authentication attempt is already in progress. Please try again in a few seconds.'];
+            return ['code' => 'busy', 'error' => 'Another Shiprocket authentication attempt is already in progress. Please try again in a few seconds.'];
         }
 
         try {
@@ -188,7 +188,8 @@ class TIS_Auth {
             if (is_wp_error($response)) {
                 self::record_failure();
                 tis_log('error', 'Shiprocket authentication request failed.', ['error' => $response->get_error_message()]);
-                return ['error' => 'Login request failed: ' . $response->get_error_message()];
+                // Transport-level failure: Shiprocket unreachable, not bad credentials.
+                return ['code' => 'transport', 'error' => 'Login request failed: ' . $response->get_error_message()];
             }
 
             $code = (int) wp_remote_retrieve_response_code($response);
@@ -198,7 +199,13 @@ class TIS_Auth {
                 self::record_failure();
                 $msg = is_array($body) && !empty($body['message']) ? $body['message'] : 'HTTP ' . $code;
                 tis_log('error', 'Shiprocket rejected authentication.', ['http_code' => $code, 'message' => $msg]);
-                return ['error' => 'Shiprocket rejected the login: ' . $msg];
+                // 4xx means the credentials themselves were refused; 5xx means
+                // Shiprocket is having trouble. The admin needs to be told
+                // different things in those two cases.
+                return [
+                    'code'  => ($code >= 500) ? 'transport' : 'auth_rejected',
+                    'error' => 'Shiprocket rejected the login: ' . $msg,
+                ];
             }
 
             self::clear_failures();
@@ -220,23 +227,55 @@ class TIS_Auth {
         delete_transient(self::TOKEN_KEY);
     }
 
+    /**
+     * Acquire the login mutex.
+     *
+     * Deliberately bypasses the options API. add_option() is NOT atomic: it
+     * does a get_option() existence check and then runs
+     * "INSERT ... ON DUPLICATE KEY UPDATE", which never errors on a duplicate.
+     * Two concurrent requests can both pass the check and both come back
+     * truthy — i.e. two simultaneous logins, the exact authentication storm
+     * this lock exists to prevent.
+     *
+     * A bare INSERT against the UNIQUE option_name key does fail for the
+     * loser of the race, which is the property we actually need. Because we
+     * write around the options API, this key must never be read back through
+     * get_option() — nothing else touches it.
+     *
+     * @return bool True if this caller now owns the lock.
+     */
     protected static function acquire_lock() {
 
-        $existing = get_option(self::LOCK_KEY);
-        if ($existing && (time() - (int) $existing) > self::LOCK_TTL) {
-            // A previous login died mid-flight (e.g. PHP timeout) without
-            // releasing the lock. Treat it as stale and reclaim it.
-            delete_option(self::LOCK_KEY);
-        }
+        global $wpdb;
 
-        // add_option() is a plain INSERT against a UNIQUE key in wp_options,
-        // so under concurrent requests exactly one of them wins this race —
-        // a lightweight mutex without needing an external lock service.
-        return (bool) add_option(self::LOCK_KEY, time(), '', false);
+        // Reclaim a lock left behind by a login that died mid-flight (e.g. a
+        // PHP timeout, which skips the finally block). The age test is part of
+        // the DELETE so a live lock can never be removed by a racing caller.
+        $wpdb->query($wpdb->prepare(
+            "DELETE FROM {$wpdb->options} WHERE option_name = %s AND CAST(option_value AS UNSIGNED) < %d",
+            self::LOCK_KEY,
+            time() - self::LOCK_TTL
+        ));
+
+        $suppress = $wpdb->suppress_errors(true);
+
+        // 1 on insert, false on duplicate key — the loser is told it lost.
+        $acquired = $wpdb->query($wpdb->prepare(
+            "INSERT INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, %s, 'off')",
+            self::LOCK_KEY,
+            (string) time()
+        ));
+
+        $wpdb->suppress_errors($suppress);
+
+        return (1 === $acquired);
     }
 
     protected static function release_lock() {
-        delete_option(self::LOCK_KEY);
+
+        global $wpdb;
+
+        $wpdb->delete($wpdb->options, ['option_name' => self::LOCK_KEY], ['%s']);
     }
 
     protected static function record_failure() {

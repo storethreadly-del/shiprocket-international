@@ -21,7 +21,7 @@ if (!defined('ABSPATH')) exit;
  * @return string[]
  */
 function tis_warm_countries() {
-    $raw  = (string) get_option('tis_warm_countries', 'US,GB,AE,AU,CA,SG');
+    $raw  = (string) get_option('tis_warm_countries', 'AE');
     $list = array_filter(array_map('trim', explode(',', strtoupper($raw))));
     return array_values(array_unique($list));
 }
@@ -32,7 +32,7 @@ function tis_warm_countries() {
  * @return float[]
  */
 function tis_warm_slabs() {
-    $raw  = (string) get_option('tis_warm_slabs', '0.5,1,1.5,2,2.5,3,4,5');
+    $raw  = (string) get_option('tis_warm_slabs', '0.5,1,1.5,2,2.5,3,3.5,4,4.5,5');
     $list = array_filter(array_map('floatval', array_map('trim', explode(',', $raw))));
     sort($list);
     return array_values(array_unique($list));
@@ -47,7 +47,7 @@ function tis_warm_rates_now() {
 
     tis_log('info', 'Shiprocket rate warm started.');
 
-    $summary = ['ok' => 0, 'empty' => 0, 'failed' => 0, 'errors' => []];
+    $summary = ['ok' => 0, 'empty' => 0, 'failed' => 0, 'skipped' => 0, 'errors' => []];
 
     $token = TIS_API::background_token();
     if (is_array($token) && isset($token['error'])) {
@@ -64,10 +64,57 @@ function tis_warm_rates_now() {
     $delay_us = (int) apply_filters('tis_warm_delay_microseconds', 250000);
     $timeout  = (float) apply_filters('tis_warm_timeout', 20);
 
+    // Wall-clock budget. Even a modest lane count multiplied by the per-request
+    // timeout can exceed max_execution_time, and on WP-Cron that stalls a real
+    // page request. Stop cleanly and leave the rest for the next run instead of
+    // being killed mid-flight.
+    $budget   = (float) apply_filters('tis_warm_budget_seconds', 60);
+    $started  = microtime(true);
+
+    // A 401 mid-run means TIS_API::request() has already dropped the cached
+    // token. Re-authenticating once is allowed; the dead token must never be
+    // reused for the remaining lanes.
+    $reauthed = false;
+
     foreach (tis_warm_countries() as $country) {
         foreach (tis_warm_slabs() as $weight) {
 
+            if ((microtime(true) - $started) > $budget) {
+                $summary['skipped']++;
+                continue;
+            }
+
             $result = TIS_API::request($country, $weight, 0, $token, $timeout);
+
+            // 401 invalidated the token we are holding. Re-auth once, then
+            // retry this lane; if re-auth fails, abort rather than hammer
+            // Shiprocket with a credential we know is rejected.
+            if (401 === ($result['http_code'] ?? null) && !$reauthed) {
+
+                $reauthed = true;
+                tis_log('notice', 'Shiprocket returned 401 mid-warm; re-authenticating once.');
+
+                $fresh = TIS_API::background_token();
+
+                if (is_array($fresh) && isset($fresh['error'])) {
+                    $summary['errors'][] = 'Re-authentication failed: ' . $fresh['error'];
+                    $summary['failed']++;
+                    tis_log('error', 'Shiprocket rate warm aborted — re-authentication failed after 401.', ['error' => $fresh['error']]);
+                    break 2;
+                }
+
+                $token  = $fresh;
+                $result = TIS_API::request($country, $weight, 0, $token, $timeout);
+            }
+
+            // Still 401 after a refresh, or a second 401 later in the run: the
+            // credential is not going to start working. Stop.
+            if (401 === ($result['http_code'] ?? null)) {
+                $summary['errors'][] = 'Shiprocket rejected the token after re-authentication.';
+                $summary['failed']++;
+                tis_log('error', 'Shiprocket rate warm aborted — 401 persisted after re-authentication.');
+                break 2;
+            }
 
             if (!empty($result['error'])) {
                 $summary['failed']++;

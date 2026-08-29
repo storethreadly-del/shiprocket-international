@@ -36,6 +36,9 @@ define('TIS_VERSION', '0.2.0');
 define('TIS_PATH', plugin_dir_path(__FILE__));
 define('TIS_CRON_HOOK', 'tis_warm_rates');
 
+/** Bumped when stored data needs a one-time migration. See tis_maybe_migrate(). */
+define('TIS_DB_VERSION', 1);
+
 if (!defined('TIS_SR_API_BASE')) {
     define('TIS_SR_API_BASE', 'https://apiv2.shiprocket.in/v1/external/');
 }
@@ -58,11 +61,57 @@ function tis_log($level, $message, $context = []) {
     wc_get_logger()->log($level, $message, $context);
 }
 
+/**
+ * One-time data migrations.
+ *
+ * v1: force this plugin's options off autoload. Saved without an explicit
+ * autoload argument, WordPress resolves the value to 'auto', which autoloads —
+ * meaning the Shiprocket password sat in alloptions on every request. This
+ * cannot be repaired with update_option(): that function returns early when the
+ * value is unchanged and never reaches its autoload handling, and the password
+ * field is intentionally left blank on re-save, so the row would never be
+ * rewritten. A direct UPDATE is the only thing that fixes an existing install.
+ */
+function tis_maybe_migrate() {
+
+    if ((int) get_option('tis_db_version', 0) >= TIS_DB_VERSION) {
+        return;
+    }
+
+    global $wpdb;
+
+    $names = [
+        'tis_sr_email', 'tis_sr_password', 'tis_pickup_pincode',
+        'tis_warm_countries', 'tis_warm_slabs', 'tis_cache_hours',
+        'tis_last_warm', 'tis_last_success', 'tis_last_error',
+    ];
+
+    $placeholders = implode(',', array_fill(0, count($names), '%s'));
+
+    $changed = $wpdb->query($wpdb->prepare(
+        "UPDATE {$wpdb->options} SET autoload = 'off'
+         WHERE option_name IN ($placeholders) AND autoload NOT IN ('off', 'no')",
+        $names
+    ));
+
+    if ($changed) {
+        // alloptions still holds the rows we just demoted.
+        wp_cache_delete('alloptions', 'options');
+        tis_log('info', 'Moved plugin options off autoload.', ['rows' => (int) $changed]);
+    }
+
+    // Autoloaded deliberately: a tiny integer read on every request is cheaper
+    // than the uncached lookup this guard would otherwise cost.
+    update_option('tis_db_version', TIS_DB_VERSION, true);
+}
+
 add_action('plugins_loaded', function () {
 
     if (!class_exists('WooCommerce')) {
         return;
     }
+
+    tis_maybe_migrate();
 
     require_once TIS_PATH . 'includes/class-tis-auth.php';
     require_once TIS_PATH . 'includes/class-tis-api.php';
@@ -87,6 +136,19 @@ add_action('plugins_loaded', function () {
         });
     }
 }, 20);
+
+/**
+ * "Settings" shortcut on the Plugins screen, so setup is one click from
+ * activation rather than a hunt through the WooCommerce menu.
+ */
+add_filter('plugin_action_links_' . plugin_basename(__FILE__), function ($links) {
+    array_unshift($links, sprintf(
+        '<a href="%s">%s</a>',
+        esc_url(admin_url('admin.php?page=tis-settings')),
+        esc_html__('Settings', 'threadly-intl-shipping')
+    ));
+    return $links;
+});
 
 register_activation_hook(__FILE__, function () {
     if (!wp_next_scheduled(TIS_CRON_HOOK)) {

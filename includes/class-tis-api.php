@@ -35,6 +35,14 @@ class TIS_API {
     const CIRCUIT_KEY  = 'tis_circuit_open';
 
     /**
+     * How long a "no couriers available" answer is cached. Deliberately far
+     * shorter than the normal rate TTL — an empty result is much more likely to
+     * be transient than a real rate card, and caching it for a full day would
+     * hold the lane on the fallback rate long after service returned.
+     */
+    const EMPTY_CACHE_TTL = HOUR_IN_SECONDS;
+
+    /**
      * Shiprocket API base. This plugin authenticates independently of HIBOU
      * (see class-tis-auth.php) so it does not borrow HIBOU's constant here.
      */
@@ -155,14 +163,57 @@ class TIS_API {
             return [];
         }
 
+        if (empty($result['rates'])) {
+            // A live call that legitimately returned no couriers. Cache it only
+            // briefly: at the full TTL a momentary "no couriers" answer would
+            // pin this lane to the fallback rate for more than a day. Matches
+            // the warmer's policy for the same case.
+            self::set_cached($country, $weight, $cod, [], self::EMPTY_CACHE_TTL);
+            return [];
+        }
+
         self::set_cached($country, $weight, $cod, $result['rates']);
         return $result['rates'];
     }
 
     /**
-     * Perform the HTTP call. Used by the warmer, the probe, and the live fallback.
+     * Build the query parameters for a serviceability call.
      *
-     * @return array { rates: array, raw: mixed, error: string, url: string }
+     * Single source of truth for the request shape, so that anything reporting
+     * on the request (diagnostics, logs) always describes what is genuinely
+     * sent rather than a copy that can drift.
+     *
+     * @return array
+     */
+    public static function build_params($country, $weight, $cod) {
+
+        $params = [
+            self::PARAM_PICKUP  => self::pickup_pincode(),
+            self::PARAM_COUNTRY => self::country_value($country),
+            self::PARAM_WEIGHT  => $weight,
+            self::PARAM_COD     => $cod ? 1 : 0,
+        ];
+
+        return apply_filters('tis_request_params', $params, $country, $weight, $cod);
+    }
+
+    /**
+     * The exact query string this plugin would send, for logging.
+     *
+     * Contains no credentials: the token is sent as an Authorization header and
+     * never appears in the URL.
+     *
+     * @return string
+     */
+    public static function describe_request_params($country, $weight, $cod) {
+        return http_build_query(self::build_params($country, $weight, $cod));
+    }
+
+    /**
+     * Perform the HTTP call. Used by the warmer, the connection test, and the
+     * live checkout fallback.
+     *
+     * @return array { rates: array, raw: mixed, error: string, url: string, http_code: int }
      */
     public static function request($country, $weight, $cod, $token, $timeout = 20) {
 
@@ -174,13 +225,7 @@ class TIS_API {
             return ['error' => $err, 'rates' => []];
         }
 
-        $params = [
-            self::PARAM_PICKUP  => $pickup,
-            self::PARAM_COUNTRY => self::country_value($country),
-            self::PARAM_WEIGHT  => $weight,
-            self::PARAM_COD     => $cod ? 1 : 0,
-        ];
-        $params = apply_filters('tis_request_params', $params, $country, $weight, $cod);
+        $params = self::build_params($country, $weight, $cod);
 
         $url = self::base_url() . ltrim(self::ENDPOINT, '/') . '?' . http_build_query($params);
 
@@ -213,7 +258,10 @@ class TIS_API {
             $msg = is_array($body) && !empty($body['message']) ? $body['message'] : 'HTTP ' . $code;
             tis_log('warning', 'Shiprocket rate request failed.', ['country' => $country, 'weight' => $weight, 'http_code' => $code, 'message' => $msg]);
             self::record_error($country, $weight, $msg, $code);
-            return ['error' => $msg, 'rates' => [], 'raw' => $body, 'url' => $url];
+            // http_code is part of the contract: callers (notably the warmer)
+            // must be able to distinguish a 401 from any other failure so they
+            // can stop reusing a token Shiprocket has already rejected.
+            return ['error' => $msg, 'rates' => [], 'raw' => $body, 'url' => $url, 'http_code' => $code];
         }
 
         $rates = self::parse_rates($body);
@@ -248,10 +296,108 @@ class TIS_API {
     }
 
     /**
-     * Normalise Shiprocket's response into a predictable shape.
+     * Charge for one courier row, with the field it came from.
      *
-     * Handles the two envelopes Shiprocket is known to use on the domestic
-     * endpoint; if international differs, correct this one method.
+     * Domestic couriers carry the charge in a flat `rate`. International ones
+     * were observed returning `rate` = 0 with the real charge held elsewhere
+     * (`tariff_data` / `weight_cases`), which silently dropped every courier.
+     *
+     * Two rules matter here:
+     *  - Never stop at the first *numeric* candidate, only the first *positive*
+     *    one. Stopping at a numeric zero is what made the fallback chain dead
+     *    code for exactly the international payloads it existed to handle.
+     *  - The nested search is deliberately conservative and reports which key
+     *    it used, because the exact international structure is still only
+     *    partially observed. If it picks the wrong number, the log says so.
+     *
+     * @return array [float $rate, string $source_key]
+     */
+    protected static function extract_rate($row) {
+
+        $flat = ['rate', 'freight_charge', 'total_charge', 'shipping_charge', 'final_charge', 'rate_without_gst'];
+
+        foreach ($flat as $k) {
+            if (isset($row[$k]) && is_numeric($row[$k]) && (float) $row[$k] > 0) {
+                return [(float) $row[$k], $k];
+            }
+        }
+
+        foreach (['tariff_data', 'weight_cases', 'tariff', 'rate_data'] as $k) {
+            if (isset($row[$k]) && is_array($row[$k])) {
+                list($found, $path) = self::find_nested_charge($row[$k]);
+                if ($found > 0) {
+                    return [$found, $k . '.' . $path];
+                }
+            }
+        }
+
+        return [0.0, 'none'];
+    }
+
+    /**
+     * Depth-limited hunt for a positive charge inside a nested structure.
+     *
+     * Only keys that name a charge are considered, and rates-per-unit, taxes
+     * and weights are excluded so a per-kg tariff or a GST percentage can never
+     * be mistaken for the shipment total.
+     *
+     * @return array [float $value, string $path]
+     */
+    protected static function find_nested_charge($node, $depth = 0) {
+
+        if (!is_array($node) || $depth > 4) {
+            return [0.0, ''];
+        }
+
+        foreach ($node as $k => $v) {
+            if (!is_string($k) || !is_numeric($v) || (float) $v <= 0) {
+                continue;
+            }
+            if (preg_match('/(rate|charge|amount|total|price|freight|cost)/i', $k)
+                && !preg_match('/(percent|tax|gst|weight|min|max|volumetric|per_kg)/i', $k)) {
+                return [(float) $v, $k];
+            }
+        }
+
+        foreach ($node as $k => $v) {
+            if (is_array($v)) {
+                list($found, $path) = self::find_nested_charge($v, $depth + 1);
+                if ($found > 0) {
+                    return [$found, $k . '.' . $path];
+                }
+            }
+        }
+
+        return [0.0, ''];
+    }
+
+    /**
+     * Bounded, non-secret description of a courier row, for diagnosing a row
+     * the API returned but we could not price.
+     */
+    protected static function describe_row($row) {
+
+        $desc = ['keys' => implode(',', array_keys($row))];
+
+        foreach (['courier_name', 'courier_company_id', 'rate', 'is_international'] as $k) {
+            if (array_key_exists($k, $row) && is_scalar($row[$k])) {
+                $desc[$k] = (string) $row[$k];
+            }
+        }
+
+        foreach (['tariff_data', 'weight_cases', 'tariff', 'rate_data'] as $k) {
+            if (isset($row[$k])) {
+                $desc[$k] = is_array($row[$k])
+                    ? substr((string) wp_json_encode($row[$k]), 0, 400)
+                    : (string) $row[$k];
+            }
+        }
+
+        return $desc;
+    }
+
+    /**
+     * Normalise Shiprocket's response into a predictable shape.
      *
      * @return array List of [courier_id, courier_name, rate, transit_days, edd].
      */
@@ -270,7 +416,10 @@ class TIS_API {
             $list = $body['data'];
         }
 
-        $rates = [];
+        $rates        = [];
+        $unpriced     = [];
+        $rate_sources = [];
+
         foreach ($list as $row) {
             if (!is_array($row)) {
                 continue;
@@ -281,17 +430,17 @@ class TIS_API {
                 continue;
             }
 
-            $rate = 0;
-            foreach (['rate', 'freight_charge', 'total_charge', 'shipping_charge'] as $k) {
-                if (isset($row[$k]) && is_numeric($row[$k])) {
-                    $rate = (float) $row[$k];
-                    break;
-                }
-            }
+            list($rate, $rate_source) = self::extract_rate($row);
 
             if ($rate <= 0) {
+                // Keep the row for diagnostics: a courier the API offered but we
+                // could not price is a parsing failure, not an empty result, and
+                // the two must never look the same in the log again.
+                $unpriced[] = self::describe_row($row);
                 continue;
             }
+
+            $rate_sources[] = $rate_source;
 
             $transit = null;
             foreach (['estimated_delivery_days', 'transit_time', 'edd_days', 'delivery_days'] as $k) {
@@ -335,6 +484,31 @@ class TIS_API {
                 'transit_days' => $transit,
                 'edd'          => $edd,
             ];
+        }
+
+        // The API offered couriers but none could be priced. This is a parsing
+        // failure, and previously it was indistinguishable from "no couriers
+        // available" — both just logged zero. Record the actual row structure
+        // so the correct field can be identified from the log alone.
+        if (empty($rates) && !empty($unpriced)) {
+            tis_log('error', 'Shiprocket returned couriers but none could be priced — rate field not recognised.', [
+                'couriers_offered' => count($unpriced),
+                'first_row'        => wp_json_encode($unpriced[0]),
+            ]);
+        } elseif (!empty($unpriced)) {
+            tis_log('notice', 'Some Shiprocket couriers could not be priced and were skipped.', [
+                'priced'   => count($rates),
+                'unpriced' => count($unpriced),
+            ]);
+        }
+
+        if (!empty($rates)) {
+            // Which field supplied the charge. For international this is the
+            // difference between a correct quote and a plausible wrong number.
+            tis_log('info', 'Shiprocket rates parsed.', [
+                'count'        => count($rates),
+                'rate_sources' => implode(',', array_unique($rate_sources)),
+            ]);
         }
 
         usort($rates, function ($a, $b) {

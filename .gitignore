@@ -4,3 +4,7 @@ Thumbs.db
 .env
 node_modules/
 vendor/
+
+# Live API probe transcript. Redacted, but still a record of real requests
+# against the production Shiprocket account — keep it out of the repository.
+tools/probe-result.txt

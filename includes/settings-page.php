@@ -1,0 +1,411 @@
+<?php
+/**
+ * Admin screen: configuration, cache warming, and the live API probe.
+ *
+ * The probe exists because Shiprocket's international parameter names and
+ * response envelope are not publicly documented. It dumps the raw JSON so the
+ * contract constants in class-tis-api.php can be corrected from evidence
+ * rather than guesswork.
+ *
+ * @package Threadly_Intl_Shipping
+ */
+
+if (!defined('ABSPATH')) exit;
+
+add_action('admin_menu', function () {
+    add_submenu_page(
+        'woocommerce',
+        __('International Shipping', 'threadly-intl-shipping'),
+        __('Intl Shipping', 'threadly-intl-shipping'),
+        'manage_woocommerce',
+        'tis-settings',
+        'tis_render_settings_page'
+    );
+});
+
+/**
+ * Handle a posted action. Returns notice markup, or ''.
+ */
+function tis_handle_settings_post(&$probe) {
+
+    if (empty($_POST['tis_action'])) {
+        return '';
+    }
+
+    if (!current_user_can('manage_woocommerce')) {
+        return '<div class="notice notice-error"><p>' . esc_html__('You do not have permission to do that.', 'threadly-intl-shipping') . '</p></div>';
+    }
+
+    check_admin_referer('tis_settings');
+
+    $action = sanitize_key(wp_unslash($_POST['tis_action']));
+
+    if ('save' === $action) {
+
+        update_option('tis_sr_email', sanitize_email(wp_unslash($_POST['tis_sr_email'] ?? '')));
+
+        // Password field is left blank in the form when a value is already saved
+        // (never echo a stored secret back into a form). Only overwrite it when
+        // the admin actually typed something.
+        $password = (string) wp_unslash($_POST['tis_sr_password'] ?? '');
+        if ('' !== $password) {
+            update_option('tis_sr_password', $password);
+            TIS_Auth::clear_failures();
+            delete_transient(TIS_Auth::TOKEN_KEY);
+        }
+
+        update_option('tis_pickup_pincode', sanitize_text_field(wp_unslash($_POST['tis_pickup_pincode'] ?? '')));
+        update_option('tis_warm_countries', sanitize_text_field(wp_unslash($_POST['tis_warm_countries'] ?? '')));
+        update_option('tis_warm_slabs', sanitize_text_field(wp_unslash($_POST['tis_warm_slabs'] ?? '')));
+        update_option('tis_cache_hours', max(1, (int) ($_POST['tis_cache_hours'] ?? 26)));
+
+        return '<div class="notice notice-success is-dismissible"><p>' . esc_html__('Settings saved.', 'threadly-intl-shipping') . '</p></div>';
+    }
+
+    if ('clear_credentials' === $action) {
+        delete_option('tis_sr_password');
+        delete_transient(TIS_Auth::TOKEN_KEY);
+        TIS_Auth::clear_failures();
+        return '<div class="notice notice-success is-dismissible"><p>' . esc_html__('Stored Shiprocket password cleared.', 'threadly-intl-shipping') . '</p></div>';
+    }
+
+    if ('clear_token' === $action) {
+        TIS_Auth::forget();
+        return '<div class="notice notice-success is-dismissible"><p>' . esc_html__('Cached Shiprocket token cleared. The next warm or test will re-authenticate.', 'threadly-intl-shipping') . '</p></div>';
+    }
+
+    if ('test_connection' === $action) {
+
+        $result = TIS_Auth::test_connection();
+
+        if (is_array($result) && isset($result['error'])) {
+            return '<div class="notice notice-error"><p><strong>' . esc_html__('Connection test failed:', 'threadly-intl-shipping') . '</strong> '
+                . esc_html($result['error']) . '</p></div>';
+        }
+
+        return '<div class="notice notice-success is-dismissible"><p>' . esc_html__('Connection test succeeded — Shiprocket accepted the credentials and a token is cached.', 'threadly-intl-shipping') . '</p></div>';
+    }
+
+    if ('warm' === $action) {
+
+        $summary = tis_warm_rates_now();
+
+        $msg = sprintf(
+            /* translators: 1: cached lanes, 2: empty lanes, 3: failed lanes */
+            esc_html__('Warm complete. %1$d lanes cached, %2$d returned no couriers, %3$d failed.', 'threadly-intl-shipping'),
+            (int) $summary['ok'],
+            (int) $summary['empty'],
+            (int) $summary['failed']
+        );
+
+        $class = $summary['failed'] > 0 ? 'notice-warning' : 'notice-success';
+        $out   = '<div class="notice ' . $class . '"><p>' . $msg . '</p>';
+
+        foreach ($summary['errors'] as $err) {
+            $out .= '<p><code>' . esc_html($err) . '</code></p>';
+        }
+
+        return $out . '</div>';
+    }
+
+    if ('probe' === $action) {
+
+        $country = strtoupper(sanitize_text_field(wp_unslash($_POST['tis_probe_country'] ?? 'US')));
+        $weight  = (float) ($_POST['tis_probe_weight'] ?? 0.5);
+
+        $token = TIS_API::background_token();
+
+        if (is_array($token) && isset($token['error'])) {
+            return '<div class="notice notice-error"><p>' . esc_html__('Authentication failed: ', 'threadly-intl-shipping')
+                . esc_html($token['error']) . '</p></div>';
+        }
+
+        $probe = TIS_API::request($country, $weight, 0, $token, 30);
+        $probe['country'] = $country;
+        $probe['weight']  = $weight;
+
+        return '';
+    }
+
+    return '';
+}
+
+function tis_render_settings_page() {
+
+    if (!current_user_can('manage_woocommerce')) {
+        wp_die(esc_html__('You do not have permission to access this page.', 'threadly-intl-shipping'));
+    }
+
+    $probe  = null;
+    $notice = tis_handle_settings_post($probe);
+
+    $last   = get_option('tis_last_warm', []);
+    $status = TIS_Auth::status();
+
+    ?>
+    <div class="wrap">
+        <h1><?php esc_html_e('International Shipping (Shiprocket X)', 'threadly-intl-shipping'); ?></h1>
+
+        <?php echo $notice; // Escaped at construction. ?>
+
+        <?php if (!$status['configured']) : ?>
+            <div class="notice notice-warning">
+                <p><?php esc_html_e('No Shiprocket API user configured. Add one below — a dedicated API user for this plugin, separate from any other Shiprocket integration on the account, is recommended so a login failure here cannot lock out anything else and vice versa.', 'threadly-intl-shipping'); ?></p>
+            </div>
+        <?php elseif ($status['blocked_for'] > 0) : ?>
+            <div class="notice notice-error">
+                <p><?php
+                    printf(
+                        /* translators: %s: minutes remaining */
+                        esc_html__('Shiprocket login is paused after repeated failures. Retrying automatically in %s minute(s). Check the API user credentials below.', 'threadly-intl-shipping'),
+                        esc_html((string) ceil($status['blocked_for'] / MINUTE_IN_SECONDS))
+                    );
+                ?></p>
+            </div>
+        <?php elseif (!$status['has_token']) : ?>
+            <div class="notice notice-info">
+                <p><?php esc_html_e('No warm Shiprocket token is cached right now. Checkout will serve cached or fallback rates until the next warm runs — by design, it never performs a blocking login while a customer waits. Click "Warm rate cache now" to log in immediately.', 'threadly-intl-shipping'); ?></p>
+            </div>
+        <?php else : ?>
+            <div class="notice notice-success">
+                <p><?php esc_html_e('Shiprocket authentication is healthy — a valid token is cached.', 'threadly-intl-shipping'); ?>
+                <?php if ('wp-config' === $status['source']) : ?>
+                    <?php esc_html_e('Credentials are sourced from wp-config.php constants.', 'threadly-intl-shipping'); ?>
+                <?php endif; ?>
+                </p>
+            </div>
+        <?php endif; ?>
+
+        <?php if (TIS_API::circuit_is_open()) : ?>
+            <div class="notice notice-warning">
+                <p><?php esc_html_e('The rate-fetch circuit breaker is currently open — live calls are paused after a failure. Cached and fallback rates are still being served. Running a warm below will reset it.', 'threadly-intl-shipping'); ?></p>
+            </div>
+        <?php endif; ?>
+
+        <h2><?php esc_html_e('Diagnostics', 'threadly-intl-shipping'); ?></h2>
+        <table class="widefat" style="max-width:70em">
+            <tbody>
+                <tr>
+                    <td style="width:220px"><strong><?php esc_html_e('Last successful request', 'threadly-intl-shipping'); ?></strong></td>
+                    <td>
+                        <?php $ok = get_option('tis_last_success'); ?>
+                        <?php if (!empty($ok['time'])) : ?>
+                            <?php
+                            printf(
+                                /* translators: 1: time ago, 2: country, 3: weight, 4: courier count */
+                                esc_html__('%1$s ago — %2$s at %3$skg, %4$d courier(s) returned.', 'threadly-intl-shipping'),
+                                esc_html(human_time_diff((int) $ok['time'], time())),
+                                esc_html($ok['country'] ?? '—'),
+                                esc_html((string) ($ok['weight'] ?? '—')),
+                                (int) ($ok['couriers'] ?? 0)
+                            );
+                            ?>
+                        <?php else : ?>
+                            <?php esc_html_e('None recorded yet.', 'threadly-intl-shipping'); ?>
+                        <?php endif; ?>
+                    </td>
+                </tr>
+                <tr>
+                    <td><strong><?php esc_html_e('Last API error', 'threadly-intl-shipping'); ?></strong></td>
+                    <td>
+                        <?php $err = get_option('tis_last_error'); ?>
+                        <?php if (!empty($err['time'])) : ?>
+                            <?php
+                            printf(
+                                /* translators: 1: time ago, 2: country, 3: weight, 4: error message */
+                                esc_html__('%1$s ago — %2$s at %3$skg: %4$s', 'threadly-intl-shipping'),
+                                esc_html(human_time_diff((int) $err['time'], time())),
+                                esc_html($err['country'] ?? '—'),
+                                esc_html((string) ($err['weight'] ?? '—')),
+                                esc_html($err['message'] ?? '')
+                            );
+                            ?>
+                        <?php else : ?>
+                            <?php esc_html_e('None recorded yet.', 'threadly-intl-shipping'); ?>
+                        <?php endif; ?>
+                    </td>
+                </tr>
+            </tbody>
+        </table>
+        <p class="description">
+            <?php
+            printf(
+                /* translators: %s: link to WooCommerce logs */
+                wp_kses(__('Full request/response detail (never including passwords or tokens) is written to the <a href="%s">WooCommerce log</a> under source "tis-shiprocket".', 'threadly-intl-shipping'), ['a' => ['href' => []]]),
+                esc_url(admin_url('admin.php?page=wc-status&tab=logs'))
+            );
+            ?>
+        </p>
+
+        <form method="post">
+            <?php wp_nonce_field('tis_settings'); ?>
+
+            <h2><?php esc_html_e('Shiprocket API user', 'threadly-intl-shipping'); ?></h2>
+            <table class="form-table" role="presentation">
+                <?php if ('wp-config' === $status['source']) : ?>
+                <tr>
+                    <th scope="row"><?php esc_html_e('Email / Password', 'threadly-intl-shipping'); ?></th>
+                    <td><p class="description"><?php esc_html_e('Defined via TIS_SR_EMAIL / TIS_SR_PASSWORD constants in wp-config.php — the fields below are disabled while those constants are set.', 'threadly-intl-shipping'); ?></p></td>
+                </tr>
+                <?php else : ?>
+                <tr>
+                    <th scope="row"><label for="tis_sr_email"><?php esc_html_e('API user email', 'threadly-intl-shipping'); ?></label></th>
+                    <td>
+                        <input name="tis_sr_email" id="tis_sr_email" type="email" class="regular-text"
+                               value="<?php echo esc_attr(get_option('tis_sr_email', '')); ?>" autocomplete="off">
+                        <p class="description"><?php esc_html_e('Create this as its own API user in the Shiprocket dashboard (Settings > API > Configure) — do not reuse an API user another plugin or integration already authenticates with.', 'threadly-intl-shipping'); ?></p>
+                    </td>
+                </tr>
+                <tr>
+                    <th scope="row"><label for="tis_sr_password"><?php esc_html_e('API user password', 'threadly-intl-shipping'); ?></label></th>
+                    <td>
+                        <input name="tis_sr_password" id="tis_sr_password" type="password" class="regular-text"
+                               placeholder="<?php echo $status['configured'] ? esc_attr__('•••••••• (saved — leave blank to keep)', 'threadly-intl-shipping') : ''; ?>"
+                               autocomplete="new-password">
+                        <?php if ($status['configured']) : ?>
+                            <button type="submit" name="tis_action" value="clear_credentials" class="button-link-delete" style="margin-left:8px"
+                                    onclick="return confirm('<?php echo esc_js(__('Remove the stored Shiprocket password?', 'threadly-intl-shipping')); ?>');">
+                                <?php esc_html_e('Clear', 'threadly-intl-shipping'); ?>
+                            </button>
+                        <?php endif; ?>
+                    </td>
+                </tr>
+                <?php endif; ?>
+            </table>
+
+            <p>
+                <button type="submit" name="tis_action" value="test_connection" class="button">
+                    <?php esc_html_e('Test connection', 'threadly-intl-shipping'); ?>
+                </button>
+                <span class="description"><?php esc_html_e('Authenticates immediately with the credentials above. Does not touch checkout or the rate cache.', 'threadly-intl-shipping'); ?></span>
+            </p>
+            <?php if ($status['has_token']) : ?>
+            <p>
+                <button type="submit" name="tis_action" value="clear_token" class="button">
+                    <?php esc_html_e('Clear cached token', 'threadly-intl-shipping'); ?>
+                </button>
+                <span class="description"><?php esc_html_e('Forces the next warm or test to re-authenticate. Credentials are kept.', 'threadly-intl-shipping'); ?></span>
+            </p>
+            <?php endif; ?>
+
+            <h2><?php esc_html_e('Configuration', 'threadly-intl-shipping'); ?></h2>
+            <table class="form-table" role="presentation">
+                <tr>
+                    <th scope="row"><label for="tis_pickup_pincode"><?php esc_html_e('Pickup pincode', 'threadly-intl-shipping'); ?></label></th>
+                    <td>
+                        <input name="tis_pickup_pincode" id="tis_pickup_pincode" type="text" class="regular-text"
+                               value="<?php echo esc_attr(get_option('tis_pickup_pincode', '')); ?>"
+                               placeholder="<?php echo esc_attr(get_option('woocommerce_store_postcode', '')); ?>">
+                        <p class="description"><?php esc_html_e('Origin for rate lookups. Leave blank to use the WooCommerce store postcode. Not every Indian pincode is internationally serviceable.', 'threadly-intl-shipping'); ?></p>
+                    </td>
+                </tr>
+                <tr>
+                    <th scope="row"><label for="tis_warm_countries"><?php esc_html_e('Destination countries', 'threadly-intl-shipping'); ?></label></th>
+                    <td>
+                        <input name="tis_warm_countries" id="tis_warm_countries" type="text" class="regular-text"
+                               value="<?php echo esc_attr(get_option('tis_warm_countries', 'US,GB,AE,AU,CA,SG')); ?>">
+                        <p class="description"><?php esc_html_e('Comma-separated ISO-2 codes to pre-cache daily. Countries outside this list still work — they fall through to a live call on first request.', 'threadly-intl-shipping'); ?></p>
+                    </td>
+                </tr>
+                <tr>
+                    <th scope="row"><label for="tis_warm_slabs"><?php esc_html_e('Weight slabs (kg)', 'threadly-intl-shipping'); ?></label></th>
+                    <td>
+                        <input name="tis_warm_slabs" id="tis_warm_slabs" type="text" class="regular-text"
+                               value="<?php echo esc_attr(get_option('tis_warm_slabs', '0.5,1,1.5,2,2.5,3,4,5')); ?>">
+                        <p class="description"><?php esc_html_e('Billable weight is rounded up to the next 0.5kg, so these should be multiples of 0.5 to guarantee cache hits.', 'threadly-intl-shipping'); ?></p>
+                    </td>
+                </tr>
+                <tr>
+                    <th scope="row"><label for="tis_cache_hours"><?php esc_html_e('Cache lifetime (hours)', 'threadly-intl-shipping'); ?></label></th>
+                    <td>
+                        <input name="tis_cache_hours" id="tis_cache_hours" type="number" min="1" step="1" class="small-text"
+                               value="<?php echo esc_attr(get_option('tis_cache_hours', 26)); ?>">
+                        <p class="description"><?php esc_html_e('Keep this above 24 so the daily warm overlaps rather than leaving a gap. International rate cards do not change intraday.', 'threadly-intl-shipping'); ?></p>
+                    </td>
+                </tr>
+            </table>
+
+            <p>
+                <button type="submit" name="tis_action" value="save" class="button button-primary"><?php esc_html_e('Save settings', 'threadly-intl-shipping'); ?></button>
+                <button type="submit" name="tis_action" value="warm" class="button"><?php esc_html_e('Warm rate cache now', 'threadly-intl-shipping'); ?></button>
+            </p>
+
+            <?php if (!empty($last['time'])) : ?>
+                <p class="description">
+                    <?php
+                    printf(
+                        /* translators: %s: human readable time difference */
+                        esc_html__('Last warm: %s ago.', 'threadly-intl-shipping'),
+                        esc_html(human_time_diff((int) $last['time'], time()))
+                    );
+                    ?>
+                </p>
+            <?php endif; ?>
+
+            <hr>
+
+            <h2><?php esc_html_e('Live API probe', 'threadly-intl-shipping'); ?></h2>
+            <p class="description" style="max-width:46em">
+                <?php esc_html_e('Shiprocket does not publish readable documentation for the international serviceability endpoint, so this plugin ships with its best guess at the parameter names and response shape. Run this probe once against real credentials, read the raw JSON, and correct the CONTRACT constants at the top of includes/class-tis-api.php if they differ.', 'threadly-intl-shipping'); ?>
+            </p>
+
+            <table class="form-table" role="presentation">
+                <tr>
+                    <th scope="row"><label for="tis_probe_country"><?php esc_html_e('Country (ISO-2)', 'threadly-intl-shipping'); ?></label></th>
+                    <td><input name="tis_probe_country" id="tis_probe_country" type="text" class="small-text" value="US"></td>
+                </tr>
+                <tr>
+                    <th scope="row"><label for="tis_probe_weight"><?php esc_html_e('Weight (kg)', 'threadly-intl-shipping'); ?></label></th>
+                    <td><input name="tis_probe_weight" id="tis_probe_weight" type="number" step="0.1" min="0.1" class="small-text" value="0.5"></td>
+                </tr>
+            </table>
+
+            <p>
+                <button type="submit" name="tis_action" value="probe" class="button"><?php esc_html_e('Run live probe', 'threadly-intl-shipping'); ?></button>
+            </p>
+        </form>
+
+        <?php if (is_array($probe)) : ?>
+            <h3><?php esc_html_e('Probe result', 'threadly-intl-shipping'); ?></h3>
+
+            <p><strong><?php esc_html_e('Request URL', 'threadly-intl-shipping'); ?>:</strong><br>
+                <code style="word-break:break-all"><?php echo esc_html($probe['url'] ?? '—'); ?></code></p>
+
+            <?php if (!empty($probe['error'])) : ?>
+                <div class="notice notice-error inline"><p><?php echo esc_html($probe['error']); ?></p></div>
+            <?php endif; ?>
+
+            <p><strong><?php esc_html_e('Parsed rates', 'threadly-intl-shipping'); ?>:</strong>
+                <?php echo esc_html(count($probe['rates'] ?? [])); ?></p>
+
+            <?php if (!empty($probe['rates'])) : ?>
+                <table class="widefat striped" style="max-width:70em">
+                    <thead><tr>
+                        <th><?php esc_html_e('Courier', 'threadly-intl-shipping'); ?></th>
+                        <th><?php esc_html_e('ID', 'threadly-intl-shipping'); ?></th>
+                        <th><?php esc_html_e('Rate', 'threadly-intl-shipping'); ?></th>
+                        <th><?php esc_html_e('Transit', 'threadly-intl-shipping'); ?></th>
+                        <th><?php esc_html_e('EDD', 'threadly-intl-shipping'); ?></th>
+                    </tr></thead>
+                    <tbody>
+                    <?php foreach ($probe['rates'] as $r) : ?>
+                        <tr>
+                            <td><?php echo esc_html($r['courier_name']); ?></td>
+                            <td><?php echo esc_html($r['courier_id']); ?></td>
+                            <td><?php echo esc_html($r['rate']); ?></td>
+                            <td><?php echo esc_html((string) $r['transit_days']); ?></td>
+                            <td><?php echo esc_html((string) $r['edd']); ?></td>
+                        </tr>
+                    <?php endforeach; ?>
+                    </tbody>
+                </table>
+            <?php endif; ?>
+
+            <p><strong><?php esc_html_e('Raw response', 'threadly-intl-shipping'); ?>:</strong></p>
+            <textarea readonly rows="18" style="width:100%;font-family:monospace;font-size:12px"><?php
+                echo esc_textarea(wp_json_encode($probe['raw'] ?? null, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+            ?></textarea>
+        <?php endif; ?>
+    </div>
+    <?php
+}

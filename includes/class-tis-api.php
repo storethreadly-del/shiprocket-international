@@ -314,6 +314,20 @@ class TIS_API {
      */
     protected static function extract_rate($row) {
 
+        // Verified against the live international response: `rate` is not a
+        // number but an object, with the actual INR charge nested one level in
+        //   rate: { courier_id, id, uid, rate: 921, zone, extra_info, ... }
+        // This is checked before the flat candidates because the outer key is
+        // also called "rate" — assuming a field named `rate` held a number is
+        // exactly what hid the price. Confirmed across ten weight slabs, and
+        // independently corroborated by extra_charges[0].value matching it
+        // every time.
+        if (isset($row['rate']) && is_array($row['rate'])
+            && isset($row['rate']['rate']) && is_numeric($row['rate']['rate'])
+            && (float) $row['rate']['rate'] > 0) {
+            return [(float) $row['rate']['rate'], 'rate.rate'];
+        }
+
         $flat = ['rate', 'freight_charge', 'total_charge', 'shipping_charge', 'final_charge', 'rate_without_gst'];
 
         foreach ($flat as $k) {
@@ -322,7 +336,13 @@ class TIS_API {
             }
         }
 
-        foreach (['tariff_data', 'weight_cases', 'tariff', 'rate_data'] as $k) {
+        // Deliberately excludes tariff, tariff_data and weight_cases. Live
+        // responses show tariff = 0 and tariff_data = [], while weight_cases
+        // is 4.3 — identical to rating, pickup_performance, delivery_performance
+        // and rto_performance, i.e. a courier performance score. Treating any of
+        // them as money would be reading a price into a number purely because it
+        // looks like one.
+        foreach (['rate_data'] as $k) {
             if (isset($row[$k]) && is_array($row[$k])) {
                 list($found, $path) = self::find_nested_charge($row[$k]);
                 if ($found > 0) {

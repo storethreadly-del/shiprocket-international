@@ -195,17 +195,36 @@ add_action('woocommerce_shipping_init', function () {
 
         public function calculate_shipping($package = []) {
 
-            $country = isset($package['destination']['country']) ? $package['destination']['country'] : '';
+            $provider = TS_Provider_Registry::active();
 
-            // No address yet, or domestic — the official Shiprocket plugin owns India.
-            if ('' === $country || 'IN' === $country) {
+            if (!$provider) {
+                // The plugin failed to register any provider at all. Fall back
+                // rather than leaving checkout with no shipping options.
+                $this->add_fallback_rate($package);
+                return;
+            }
+
+            $destination = [
+                'country'  => isset($package['destination']['country']) ? $package['destination']['country'] : '',
+                'postcode' => isset($package['destination']['postcode']) ? $package['destination']['postcode'] : '',
+            ];
+
+            // No address yet, or a lane this provider does not serve. Whether
+            // domestic India is in scope is a property of the active provider,
+            // not a constant of the plugin: Shiprocket declines it because the
+            // official Shiprocket plugin owns India, while iCarry will serve it.
+            if (!$provider->serves($destination)) {
                 return;
             }
 
             $weight = $this->get_billable_weight($package);
 
-            // International shipments are prepaid; COD is never applicable.
-            $rates = TIS_API::get_rates($country, $weight, 0);
+            // International shipments are prepaid, so COD is not applicable.
+            // Domestic lanes will pass the real flag here once a provider that
+            // serves them is active (SCOPE.md §4).
+            $cod = (bool) apply_filters('ts_rate_request_cod', false, $package, $provider);
+
+            $rates = $provider->rates($destination, $weight, ['cod' => $cod]);
 
             if (empty($rates)) {
                 $this->add_fallback_rate($package);
@@ -243,6 +262,12 @@ add_action('woocommerce_shipping_init', function () {
                         'tis_edd'             => $r['edd'],
                         'tis_billable_weight' => $weight,
                         'tis_base_rate'       => $r['rate'],
+                        // Which aggregator quoted this rate. Stored so a
+                        // shipment keeps syncing against the aggregator it was
+                        // booked with, even after the active provider changes
+                        // (SCOPE.md §3).
+                        'tis_provider'        => isset($r['provider']) ? $r['provider'] : $provider->id(),
+                        'tis_service_type'    => isset($r['service_type']) ? $r['service_type'] : '',
                     ],
                 ]);
             }

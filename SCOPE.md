@@ -372,6 +372,38 @@ published API, so the requests the dashboard itself makes are the contract. Capt
 one (browser DevTools > Network > "Copy as cURL", with the cookie and key removed)
 while pressing *Get Estimate*, and one while booking.
 
+### The dashboard's booking form: the data model (not the contract)
+
+From a screenshot of *Book Shipment > By Courier*. This is what the form collects
+and shows, not what the API accepts, so field names below are the labels, not
+parameters. No customer data from the screenshot is recorded here.
+
+**Booking inputs (maps onto phase 5):**
+
+| Form field | Notes for the mapper |
+|---|---|
+| Pickup Address, Shipper Address on Label, Return (RTO) Address | **Three separate saved addresses**, picked from a list, not typed per order. Phase 5 must look up or create them (the `Pickup Address` / `ADD` / `UPDATE` endpoints) and cache the ids. |
+| Contact name, mobile, alternate mobile, customer email | Alternate mobile is separate from mobile |
+| Street address, area and landmark | Each appears capped at **128 characters** (the counters read 115 and 118 remaining after 13 and 10 characters). WooCommerce address lines must be truncated or joined accordingly, or the booking may be rejected. |
+| Pincode, city, region/state | State is a dropdown, so Woo's state codes need a mapping |
+| Weight with unit (default grams), length/breadth/height with unit (cm) | Weight is entered in **grams** by default |
+| Mode: Surface / Air / Hyperlocal | This is the rate row's `service_type` |
+| Parcel type: Prepaid / Cash on Delivery | Drives the `cod` flag (phase 4) |
+| Parcel contents: Documents / Products, plus a description | |
+| Client order id, invoice no, invoice date, **invoice value** | Client order id is where the Woo order number belongs; invoice value is mandatory |
+| Pickup date | Defaults to the next working day, best effort |
+
+**Volumetric divisor is 5000 cm3/kg**, read from the site's own JS. It matches this
+plugin's `tis_volumetric_divisor` default, so `get_billable_weight()` needs no
+change.
+
+**Rate results carry more than a price.** Each courier row shows a freight charge
+*and a separate RTO charge*, a delivery-success rate, a forward transit range
+("2-4 Business Days") with an average, an average RTO time, and tags (best overall,
+fastest, most reliable, high weight discrepancy). The normalised rate row has no
+home for the RTO charge or the delivery rate. Worth adding `rto_charge` and
+`delivery_rate` in phase 3, since RTO exposure is a real cost on COD orders.
+
 ### A finding that may shrink phase 5
 
 iCarry.in already ships a **pull-based** WooCommerce connector: you give iCarry

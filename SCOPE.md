@@ -212,23 +212,77 @@ lockout on one side cannot block checkout on the other.
 
 ---
 
-## 7. Unverified contract — must be probed before build
+## 7. iCarry contract — what phase 0 established
 
-The existing code is honest about Shiprocket's international endpoint being
-guesswork pinned behind constants. iCarry is in the same position: there is no
-publicly readable developer portal, credentials come from
-*My Account → API Credentials* (or `icarry.in/api`), and the endpoint set,
-auth scheme, parameter names and response envelope are **unconfirmed**.
+Read from iCarry's own
+[Shipping APIs, Plugins & Extensions](https://www.icarry.in/pages/shipping-api-plugins-extensions.html)
+page and
+[Courier API Integration in India](https://www.icarry.in/pages/blog/courier-api-integration-india.html).
 
-So the first task is not code:
+**Confirmed.** iCarry publishes an API-first platform and *names* 19 REST
+endpoints. Every capability this project needs exists:
 
-1. Obtain iCarry API credentials.
-2. Extend the existing admin "Live probe" to target iCarry and dump raw JSON for:
-   domestic serviceability, international serviceability, shipment creation, tracking.
-3. Pin the findings into the provider class's CONTRACT block, exactly as
-   `class-tis-api.php` does today.
+| Need | iCarry endpoint (as named) | Phase |
+|---|---|---|
+| Auth | `Authentication`, `LOGIN` | 3 |
+| Domestic rating | `Get ESTIMATE - Domestic shipment (within India)` | 4 |
+| Domestic rating, one courier | `Get ESTIMATE - By Courier (Domestic India)` | 4 |
+| International rating | `Get ESTIMATE - International Shipment (India to Foreign Country)` | 3 |
+| Pincode check | `Check SERVICEABILITY by PINCODE` | 4 |
+| Book | `Book Shipment - STANDARD / EXPRESS`, `- CHOOSE COURIER`, `- INTERNATIONAL` | 5 |
+| Cancel | `CANCEL Shipment` | 5 |
+| Returns | `REVERSE Shipment` | later |
+| Tracking | `TRACK a Shipment`, `SYNC Shipment STATUS` | 6 |
+| **Status webhook** | `POST Call Back on change in Shipment STATUS` | 6 |
+| Cost reconciliation | `SYNC Shipment CHARGES` | later |
+| Labels | `PRINT Shipment Label` | 5 |
+| Pickup locations | `Pickup Address`, `ADD`, `UPDATE` | 5 |
 
-Until step 3, every estimate below is provisional.
+Credentials come from **My Account → API Credentials → Generate Key**, a one-time
+step. A WooCommerce connector already exists, as do Shopify, WIX, Zoho, Opencart
+and PrestaShop ones.
+
+**Three findings that change the plan for the better:**
+
+1. **There is a status webhook.** `POST Call Back on change in Shipment STATUS`
+   means phase 6 does not have to poll for tracking. Push is cheaper, fresher and
+   simpler, and it maps straight onto the HIE event contract in §6 — an inbound
+   callback becomes a `ts_shipment_status_changed` event with no polling layer in
+   between. Polling (`SYNC Shipment STATUS`) stays as the reconciliation fallback
+   for missed deliveries, not the primary mechanism.
+2. **Rating is split by lane, with a courier-specific variant.** Domestic and
+   international are separate endpoints, so the iCarry provider's `rate_url()`
+   picks per destination rather than sending a country to one endpoint. The
+   `By Courier` variant is what phase 5 needs to re-quote the exact courier the
+   customer chose at checkout before booking it.
+3. **`Check SERVICEABILITY by PINCODE` is cheap pre-validation.** Phase 4 can
+   reject an unserviceable pincode without spending a rate call, and cache that
+   verdict separately from rates — it changes far less often.
+
+**Still unknown, and still blocking code:** the base URL, the exact paths, the
+auth scheme (bearer token vs. API key header, and whether `LOGIN` returns a
+token with a TTL like Shiprocket's), the parameter names, and the response
+envelopes. iCarry publishes endpoint *names* only — the list is a plain `<li>`
+list with no links, no schemas and no examples. The detail is behind account
+login or a support ticket.
+
+**Two ways to close it:**
+
+- **The open-source connector.** iCarry's own WooCommerce plugin is published on
+  wordpress.org, so its source contains the real paths, parameters and envelopes
+  — verified facts, no credentials needed, no guessing. This is the preferred
+  route. It needs `downloads.wordpress.org` / `plugins.svn.wordpress.org`
+  reachable *and* permission to fetch from them; the hosts are now allowed but
+  the fetch itself was refused by the session's permission classifier.
+- **The account.** Log in to iCarry, generate the API key, and share whatever
+  documentation the API Credentials screen links to. (The key itself goes in the
+  plugin's settings screen or a wp-config constant — not into chat.)
+
+Once either lands, the remaining work is as before: extend the admin probe to
+target iCarry, dump raw JSON per endpoint, and pin the findings into the
+provider's CONTRACT block exactly as `class-ts-provider-shiprocket.php` does.
+Until then, phase 3 would be writing code against guesses, which is the one thing
+this project has consistently refused to do.
 
 ---
 
@@ -236,13 +290,13 @@ Until step 3, every estimate below is provisional.
 
 | Phase | Work | Est. |
 |-------|------|------|
-| 0 | iCarry API discovery + probe harness | 0.5–1 d |
+| 0 | iCarry API discovery + probe harness — *endpoint set confirmed, paths/auth still blocked (§7)* | 0.5–1 d |
 | 1 | ~~Provider interface; refactor Shiprocket behind it (no behaviour change)~~ **done** | 1.5–2 d |
 | 2 | ~~Active-provider setting, switch lifecycle, admin UI~~ **done** | 1 d |
 | 3 | iCarry rate provider — international | 1–1.5 d |
 | 4 | Domestic lane: pincode cache policy, volume-based warming, COD | 1.5–2 d |
 | 5 | Order sync: records, queue, push, idempotency | 2–3 d |
-| 6 | Tracking pull, customer-facing display, failed-sync admin | 1.5–2 d |
+| 6 | Tracking **via iCarry's status webhook** (§7), customer-facing display, failed-sync admin | 1.5–2 d |
 | 7 | REST read API + event contract for HIE | 1 d |
 | 8 | Hardening: provider-switch tests, duplicate-push tests, docs | 1–1.5 d |
 
@@ -360,7 +414,11 @@ that notices follow the active provider.
 
 ## 11. Risks
 
-- **iCarry contract unknown.** Biggest unknown; phase 0 exists to retire it.
+- **iCarry contract partly unknown.** The endpoint set is now confirmed and every
+  capability this project needs exists (§7). What is still missing is the base
+  URL, exact paths, auth scheme, parameter names and response envelopes — enough
+  to block writing the provider, but no longer enough to put the shape of the
+  plan in doubt.
 - **Domestic cache cannot be fully warmed.** Mitigated by top-N warming plus a
   bounded live call — decided, see §4. Domestic checkout will still be measurably
   slower than international on a cold lane; the mitigation is a per-provider

@@ -31,7 +31,7 @@ class TS_ICarry_Probe {
     /** @var callable function(string $method, string $url, array $headers, ?string $body, float $timeout): array */
     protected $transport;
 
-    public function __construct(callable $transport = null) {
+    public function __construct(?callable $transport = null) {
         $this->transport = $transport ?: [__CLASS__, 'wp_transport'];
     }
 

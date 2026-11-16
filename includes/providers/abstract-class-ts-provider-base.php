@@ -43,7 +43,7 @@ abstract class TS_Provider_Base implements TS_Provider {
     /** How long a login may hold the mutex before it is considered stale. */
     const LOCK_TTL = 25;
 
-    public function __construct(TS_Http $http = null, TS_Logger $logger = null) {
+    public function __construct(?TS_Http $http = null, ?TS_Logger $logger = null) {
         $this->http   = $http ?: new TS_Http_WP();
         $this->logger = $logger ?: new TS_Logger_Null();
     }

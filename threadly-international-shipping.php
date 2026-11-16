@@ -3,7 +3,7 @@
  * Plugin Name: Threadly International Shipping
  * Plugin URI: https://www.hibou.in
  * Description: Live cross-border courier rates, transit times and EDD at WooCommerce checkout, served by a pluggable shipping aggregator (Shiprocket X, with iCarry to follow).
- * Version: 0.3.0-dev
+ * Version: 0.3.0
  * Author: Hibou Printtech Private Ltd
  * Author URI: https://www.hibou.in
  * License: GPLv2 or later
@@ -39,7 +39,7 @@
 
 if (!defined('ABSPATH')) exit;
 
-define('TIS_VERSION', '0.3.0-dev');
+define('TIS_VERSION', '0.3.0');
 define('TIS_PATH', plugin_dir_path(__FILE__));
 define('TIS_CRON_HOOK', 'tis_warm_rates');
 

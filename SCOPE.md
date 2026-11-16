@@ -367,10 +367,8 @@ Run with the real credentials (supplied via environment variables, never printed
 - **Still unknown:** where the REST API actually lives, and how it authenticates.
   Nothing public reveals it.
 
-**Best next evidence:** the dashboard says every booking on the website uses the
-published API, so the requests the dashboard itself makes are the contract. Capture
-one (browser DevTools > Network > "Copy as cURL", with the cookie and key removed)
-while pressing *Get Estimate*, and one while booking.
+**Outcome of capturing the dashboard's own requests:** see the next two sections.
+The dashboard turned out not to use the published API at all.
 
 ### The dashboard's booking form: the data model (not the contract)
 
@@ -423,6 +421,33 @@ so it carries no stability promise; treat it as a convenience, not a contract.
   response gives iCarry's own `zone_id`s and codes to build it from.
 - It resolves a pincode to city and state, so phase 4 can fill or validate the
   destination at checkout without a rate call.
+
+### The dashboard's estimate endpoint is NOT the API: do not build on it
+
+Captured from the dashboard (values masked): `POST index.php?route=checkout/ela_custom_shipping_inner`,
+form-encoded, `submit_action=booking_recalculate_estimate`.
+
+- **Session-authenticated.** It carries `customer_id`, `cid`, three address ids and
+  a browser session cookie. The username and API password do not authenticate it.
+- **Server-rendered HTML, not data.** The JSON response is
+  `{best_courier, estimate, success, success_details}`, where `success_details` is an
+  HTML `<table>` with no per-courier objects.
+- **Hidden-field state.** `chosen_courier=<courier_id>:<price>:<freight>:<total>`
+  threads the previous selection through the request.
+
+Using it would mean storing an account email and password, faking a login, and
+scraping markup that changes with the page design, probably against iCarry's terms.
+**Rejected.** The published API (the 19 endpoints) is the integration surface, and
+its documentation has to come from iCarry.
+
+What the capture does usefully confirm (form model, not contract): weight is sent in
+grams with a unit field, `mode` is a letter (`S` for Surface), `parcel_type` is `P`
+for Prepaid, `parcel_content_type` is `ND` for non-documents, `pickup_date` is
+`YYYY-MM-DD`, the estimate's courier rows carry a numeric courier id, and the cost
+splits into freight and RTO.
+
+**To get the real documentation:** open a helpdesk ticket (the APIs page invites this)
+or email support. A ready-to-send request is kept in `docs/icarry-api-request.md`.
 
 ### A finding that may shrink phase 5
 

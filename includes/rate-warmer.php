@@ -106,8 +106,10 @@ function tis_warm_rates_now() {
         } elseif (empty($result['rates'])) {
 
             // Cache the empty result too, briefly, so a dead lane does not
-            // trigger a live call on every checkout render.
-            $provider->set_cached($destination, $weight, $opts, [], HOUR_IN_SECONDS);
+            // trigger a live call on every checkout render — but only briefly,
+            // since the lane may just have been momentarily unserviceable. Same
+            // policy the checkout path applies.
+            $provider->set_cached($destination, $weight, $opts, [], $provider->negative_cache_ttl());
             $summary['empty']++;
 
         } else {

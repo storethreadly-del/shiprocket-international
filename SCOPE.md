@@ -116,9 +116,37 @@ does not transfer. Domestic therefore gets a different cache policy:
 - key on `origin_pin × destination_pin × weight slab`, short TTL (hours);
 - warm only the top-N destination pincodes by historical order volume (read from
   past WooCommerce orders), not the whole country;
-- a cold domestic lane is allowed to make one short live call at checkout, behind
-  the existing circuit breaker and timeout, because the cache cannot be exhaustively
-  warmed. International keeps today's stricter "cache or fallback, never block" rule.
+- **a cold domestic lane makes one bounded live call at checkout** — decided; see
+  below.
+
+**Correction to an earlier draft of this section.** It claimed international keeps
+a stricter "cache or fallback, never block" rule, and framed the bounded live call
+as a relaxation for domestic. That was wrong. v0.2.0 already makes a bounded live
+call on a cold international lane; what it never does is *log in* on the customer's
+thread. So the decision makes domestic **consistent** with international rather
+than weaker than it, and the rule across both lanes is:
+
+> Never authenticate on the customer's thread. One bounded rate call on a cold
+> lane is fine, because three things together keep it safe: a short timeout, a
+> circuit breaker that stops calling a failing aggregator at all, and a token
+> that is read from cache and never minted inline.
+
+Implemented ahead of phase 4, since it is vendor-independent:
+
+- `frontend_timeout()` and `negative_cache_ttl()` are provider methods, both
+  filterable **per provider** (`tis_frontend_timeout`, `ts_negative_cache_ttl`,
+  each passed the provider id). A domestic provider that expects frequent cache
+  misses can tighten its budget below the international default of 5s without
+  affecting the other.
+- **Fixed a defect this decision made material.** The checkout path cached an
+  empty live result for the full rate TTL (26h by default), so a lane that was
+  briefly unserviceable kept serving the fallback rate for a day after the
+  aggregator recovered. The warmer had always cached empties for an hour instead;
+  the checkout path now applies that same policy, and the number lives in one
+  place. Minor for a handful of countries, bad for pincode-level lanes where a
+  cold miss is routine.
+- A transport failure is still never cached as an empty lane; it trips the
+  breaker, so the failure is not mistaken for "no couriers serve this route".
 
 Also in this move: COD. Domestic Indian orders use it heavily, international never
 does. `cod` stops being hardcoded `0` and is derived from the chosen payment method
@@ -333,9 +361,10 @@ that notices follow the active provider.
 ## 11. Risks
 
 - **iCarry contract unknown.** Biggest unknown; phase 0 exists to retire it.
-- **Domestic cache cannot be fully warmed.** Mitigated by top-N warming + a bounded
-  live call, but domestic checkout will be measurably slower than international on a
-  cold lane. Accept, or restrict domestic to warmed pincodes only.
+- **Domestic cache cannot be fully warmed.** Mitigated by top-N warming plus a
+  bounded live call — decided, see §4. Domestic checkout will still be measurably
+  slower than international on a cold lane; the mitigation is a per-provider
+  timeout that can be tightened below the international default.
 - **Duplicate shipments on sync retry.** Costs real money. Idempotency via the
   shipment record is a requirement, not a nice-to-have.
 - **Switching providers mid-fulfilment.** Handled by storing `provider` per shipment.

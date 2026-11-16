@@ -337,17 +337,55 @@ abstract class TS_Provider_Base implements TS_Provider {
             return [];
         }
 
-        $timeout = (float) apply_filters('tis_frontend_timeout', 5);
-        $result  = $this->request($destination, $weight, $opts, $token, $timeout);
+        // A BOUNDED live call. The timeout, the circuit breaker and the
+        // cache-only token rule above are what make it safe to do this while a
+        // customer waits: the request cannot hang, a failing aggregator stops
+        // being called at all, and a login never happens on this thread.
+        $result = $this->request($destination, $weight, $opts, $token, $this->frontend_timeout());
 
         if (!empty($result['error'])) {
             $this->trip_circuit();
             return [];
         }
 
-        $this->set_cached($destination, $weight, $opts, $result['rates']);
+        // Cache an empty result only briefly. A lane that returned no couriers
+        // may simply have been unserviceable for a moment; holding that for the
+        // full rate TTL would keep serving the fallback rate long after the
+        // aggregator recovered. The warmer has always made this distinction —
+        // the checkout path did not, which mattered little for a handful of
+        // countries but matters a lot for pincode-level lanes, where a cold
+        // miss is routine.
+        $ttl = empty($result['rates']) ? $this->negative_cache_ttl() : null;
+
+        $this->set_cached($destination, $weight, $opts, $result['rates'], $ttl);
 
         return $result['rates'];
+    }
+
+    /**
+     * How long a live rate call may take while a customer waits, in seconds.
+     *
+     * A provider may tighten this: a domestic lane that is expected to miss the
+     * cache often cannot afford the same budget as a rare international miss.
+     *
+     * @return float
+     */
+    protected function frontend_timeout() {
+        return (float) apply_filters('tis_frontend_timeout', 5, $this->id());
+    }
+
+    /**
+     * How long to remember that a lane returned no couriers, in seconds.
+     *
+     * Deliberately much shorter than the rate TTL — see rates().
+     *
+     * Public because the warmer applies the same policy to a lane that comes
+     * back empty, so the number lives in exactly one place.
+     *
+     * @return int
+     */
+    public function negative_cache_ttl() {
+        return (int) apply_filters('ts_negative_cache_ttl', HOUR_IN_SECONDS, $this->id());
     }
 
     public function request(array $destination, $weight, array $opts, $token, $timeout = 20) {

@@ -395,6 +395,111 @@ ok('but the override is surfaced as a warning', (bool) array_filter($result['war
 is_same('and checkout follows the filter, not the setting', TS_Provider_Registry::active_id(), 'shiprocket');
 remove_all_filters('ts_active_provider');
 
+section('Bounded live call on a cold lane');
+
+// A provider with a handle on its HTTP double, so the live path can be driven.
+$live_http = new TS_Http_Fake();
+$live      = new TS_Provider_Fake($live_http, new TS_Logger_Null());
+
+/** TTL actually recorded for a cache key, in seconds. */
+function ttl_of($key) {
+    if (!isset($GLOBALS['_transients'][$key])) {
+        return null;
+    }
+    return $GLOBALS['_transients'][$key][1] - time();
+}
+
+// NB: TS_Provider_Fake::authenticate() returns a token without any HTTP call,
+// so nothing is queued for the login — every queued response below belongs to a
+// rate request.
+$live->login(true);
+
+$dest = ['country' => 'IN', 'postcode' => '560001'];
+$opts = ['cod' => true];
+$key  = $live->cache_key($dest, 0.5, $opts);
+
+// Cold lane, couriers returned: one live call, cached for the full TTL.
+$live_http->push(['code' => 200, 'body' => ['rates' => [
+    ['id' => 'a', 'name' => 'Courier A', 'rate' => 60, 'days' => 3, 'cod' => true],
+]]]);
+
+$before = count($live_http->requests);
+$rows   = $live->rates($dest, 0.5, $opts);
+
+is_same('cold lane makes exactly one live call', count($live_http->requests) - $before, 1);
+is_same('and returns the couriers', count($rows), 1);
+ok('cached for roughly the full rate TTL', ttl_of($key) > 20 * HOUR_IN_SECONDS);
+
+// Second read is served from cache: no further call.
+$before = count($live_http->requests);
+$rows   = $live->rates($dest, 0.5, $opts);
+is_same('warm lane makes no call', count($live_http->requests) - $before, 0);
+is_same('and still returns the couriers', count($rows), 1);
+
+section('An empty live result is only remembered briefly');
+
+$dest2 = ['country' => 'IN', 'postcode' => '700001'];
+$key2  = $live->cache_key($dest2, 0.5, $opts);
+
+$live_http->push(['code' => 200, 'body' => ['rates' => []]]);
+$rows = $live->rates($dest2, 0.5, $opts);
+
+is_same('no couriers returned', $rows, []);
+ok('the empty result IS cached (so it does not re-call on every render)',
+    is_array($live->get_cached($dest2, 0.5, $opts)));
+ok('but for about an hour, not the full rate TTL', ttl_of($key2) <= HOUR_IN_SECONDS && ttl_of($key2) > 0,
+    'ttl was ' . var_export(ttl_of($key2), true));
+ok('which is far shorter than a served lane', ttl_of($key2) < ttl_of($key));
+
+$before = count($live_http->requests);
+$live->rates($dest2, 0.5, $opts);
+is_same('and it does suppress an immediate re-call', count($live_http->requests) - $before, 0);
+
+section('The live call stays bounded');
+
+// A transport failure must trip the breaker, not retry in the customer's thread.
+$dest3 = ['country' => 'IN', 'postcode' => '600001'];
+$live->reset_circuit();
+$live_http->push(['error' => 'cURL timeout after 5000ms']);
+
+$before = count($live_http->requests);
+$rows   = $live->rates($dest3, 0.5, $opts);
+
+is_same('returns nothing rather than hanging', $rows, []);
+is_same('made a single attempt, no retry', count($live_http->requests) - $before, 1);
+ok('tripped the circuit breaker', $live->circuit_is_open());
+is_same('did NOT cache the failure as an empty lane', $live->get_cached($dest3, 0.5, $opts), false);
+
+$before = count($live_http->requests);
+is_same('a later cold lane is suppressed while the breaker is open',
+    $live->rates(['country' => 'IN', 'postcode' => '411001'], 0.5, $opts), []);
+is_same('with no call attempted', count($live_http->requests) - $before, 0);
+$live->reset_circuit();
+
+section('Policy is per-provider and filterable');
+
+remove_all_filters('ts_negative_cache_ttl');
+is_same('negative TTL defaults to an hour', $live->negative_cache_ttl(), HOUR_IN_SECONDS);
+
+add_filter('ts_negative_cache_ttl', function ($ttl, $provider_id) {
+    return 'fakecarry' === $provider_id ? 300 : $ttl;
+}, 10, 2);
+
+is_same('a filter can tighten it per provider', $live->negative_cache_ttl(), 300);
+is_same('and leave another provider alone', $provider->negative_cache_ttl(), HOUR_IN_SECONDS);
+remove_all_filters('ts_negative_cache_ttl');
+
+$timeout = new ReflectionMethod('TS_Provider_Base', 'frontend_timeout');
+$timeout->setAccessible(true);
+is_same('frontend timeout defaults to 5s', $timeout->invoke($live), 5.0);
+
+add_filter('tis_frontend_timeout', function ($t, $provider_id) {
+    return 'fakecarry' === $provider_id ? 2.5 : $t;
+}, 10, 2);
+is_same('and is tightenable per provider', $timeout->invoke($live), 2.5);
+is_same('without affecting the other', $timeout->invoke($provider), 5.0);
+remove_all_filters('tis_frontend_timeout');
+
 /* =================================================================== */
 echo "\n" . str_repeat('-', 56) . "\n";
 printf("%d passed, %d failed\n", $pass, $fail);

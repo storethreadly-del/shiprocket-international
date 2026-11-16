@@ -84,12 +84,16 @@ add_action('plugins_loaded', function () {
     require_once TIS_PATH . 'includes/class-tis-auth.php';
     require_once TIS_PATH . 'includes/class-tis-api.php';
 
+    require_once TIS_PATH . 'includes/class-ts-icarry-credentials.php';
+    require_once TIS_PATH . 'includes/class-ts-icarry-probe.php';
+
     require_once TIS_PATH . 'includes/class-tis-shipping-method.php';
     require_once TIS_PATH . 'includes/rate-warmer.php';
     require_once TIS_PATH . 'includes/checkout-display.php';
 
     if (is_admin()) {
         require_once TIS_PATH . 'includes/settings-page.php';
+        require_once TIS_PATH . 'includes/icarry-probe-page.php';
     }
 
     TS_Provider_Registry::boot();

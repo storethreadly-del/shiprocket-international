@@ -322,6 +322,31 @@ endpoint, and pin the findings into the provider's CONTRACT block exactly as
 code against guesses — which, as the section above shows, is not a theoretical
 risk here.
 
+### Credentials and the discovery probe (built)
+
+iCarry.in issues a **username plus a generated API password** (not a single key,
+and not a token exchange as far as is known), and the API Credentials screen
+documents no endpoints. So the contract is discovered by probe.
+
+`TS_ICarry_Credentials` stores them (wp-config constants `TIS_IC_USER` /
+`TIS_IC_PASSWORD` take precedence over options), and `TS_ICarry_Probe` plus the
+**WooCommerce > iCarry probe** screen send one operator-built request and show
+the raw response. The operator picks how the credential is sent: HTTP Basic,
+Bearer, a custom header, or fields in a JSON body. No iCarry *provider* is
+registered yet, deliberately: registering one against an unknown contract would
+put it in the switch UI where it could be activated.
+
+Safety properties, each pinned by `tests/smoke-icarry-probe.php` and mutation
+checked (breaking the host check, the redaction, or the lockout each fails tests):
+
+- **icarry.in only**, HTTPS, exact host match. Refuses `icarry.com` (the other
+  company), `icarry.in.evil.com`, `evilicarry.in`, userinfo, odd ports.
+- **The password never leaves the server**: substituted at send time, never
+  round-tripped through the form, redacted (raw and base64) from the echoed
+  request, the response headers, the body and transport errors.
+- **Lockout protection.** Three consecutive 401/403s pause the probe for 15
+  minutes, since a failed-login lockout is per account. Success resets the count.
+
 ### A finding that may shrink phase 5
 
 iCarry.in already ships a **pull-based** WooCommerce connector: you give iCarry

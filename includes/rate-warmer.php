@@ -2,13 +2,17 @@
 /**
  * Scheduled rate warmer.
  *
- * Checkout must not wait on Shiprocket. A daily cron pre-fetches rates for the
- * configured destination countries across a set of weight slabs, so that
- * calculate_shipping() reads a warm transient and returns instantly.
+ * Checkout must not wait on an aggregator. A daily cron pre-fetches rates for
+ * the lanes the active provider nominates, so that calculate_shipping() reads a
+ * warm transient and returns instantly.
  *
- * International rating is country-level rather than pincode-level, which is what
- * makes this practical: one cached entry serves every order of that weight to
- * that country.
+ * The lane list comes from the provider rather than being computed here,
+ * because the two aggregators have genuinely different warming economics:
+ * Shiprocket's international rating is country-level, so one cached entry
+ * serves every order of that weight to that country and warming every lane is
+ * cheap. Domestic Indian rating is pincode-level and cannot be warmed
+ * exhaustively — that provider will nominate a bounded subset instead
+ * (SCOPE.md §4).
  *
  * @package Threadly_Intl_Shipping
  */
@@ -16,87 +20,114 @@
 if (!defined('ABSPATH')) exit;
 
 /**
- * Destination countries to keep warm (ISO-2 codes).
+ * Destination countries kept warm by the Shiprocket provider (ISO-2 codes).
  *
+ * @deprecated 0.3.0 Use TS_Provider_Registry::get('shiprocket')->warm_countries().
  * @return string[]
  */
 function tis_warm_countries() {
-    $raw  = (string) get_option('tis_warm_countries', 'US,GB,AE,AU,CA,SG');
-    $list = array_filter(array_map('trim', explode(',', strtoupper($raw))));
-    return array_values(array_unique($list));
+    $p = TS_Provider_Registry::get('shiprocket');
+    return $p ? $p->warm_countries() : [];
 }
 
 /**
- * Weight slabs to keep warm, in kg.
+ * Weight slabs kept warm by the Shiprocket provider, in kg.
  *
+ * @deprecated 0.3.0 Use TS_Provider_Registry::get('shiprocket')->warm_slabs().
  * @return float[]
  */
 function tis_warm_slabs() {
-    $raw  = (string) get_option('tis_warm_slabs', '0.5,1,1.5,2,2.5,3,4,5');
-    $list = array_filter(array_map('floatval', array_map('trim', explode(',', $raw))));
-    sort($list);
-    return array_values(array_unique($list));
+    $p = TS_Provider_Registry::get('shiprocket');
+    return $p ? $p->warm_slabs() : [];
 }
 
 /**
- * Warm the cache. Runs on cron, or on demand from the settings screen.
+ * Warm the cache for the active provider. Runs on cron, or on demand from the
+ * settings screen.
  *
  * @return array Summary counters for admin feedback.
  */
 function tis_warm_rates_now() {
 
-    tis_log('info', 'Shiprocket rate warm started.');
-
     $summary = ['ok' => 0, 'empty' => 0, 'failed' => 0, 'errors' => []];
 
-    $token = TIS_API::background_token();
-    if (is_array($token) && isset($token['error'])) {
-        $summary['errors'][] = $token['error'];
+    $provider = TS_Provider_Registry::active();
+
+    if (!$provider) {
+        $summary['errors'][] = 'No shipping provider is registered.';
         $summary['failed']++;
-        tis_log('error', 'Shiprocket rate warm aborted — authentication failed.', ['error' => $token['error']]);
+        tis_log('error', 'Rate warm aborted — no provider registered.');
         update_option('tis_last_warm', ['time' => time(), 'summary' => $summary], false);
         return $summary;
     }
 
-    // A successful background auth means Shiprocket is reachable again.
-    TIS_API::reset_circuit();
+    tis_log('info', 'Rate warm started.', ['provider' => $provider->id()]);
+
+    $token = $provider->token();
+
+    if (is_array($token) && isset($token['error'])) {
+        $summary['errors'][] = $token['error'];
+        $summary['failed']++;
+        tis_log('error', 'Rate warm aborted — authentication failed.', [
+            'provider' => $provider->id(),
+            'error'    => $token['error'],
+        ]);
+        update_option('tis_last_warm', ['time' => time(), 'summary' => $summary], false);
+        return $summary;
+    }
+
+    // A successful background auth means the aggregator is reachable again.
+    $provider->reset_circuit();
 
     $delay_us = (int) apply_filters('tis_warm_delay_microseconds', 250000);
     $timeout  = (float) apply_filters('tis_warm_timeout', 20);
 
-    foreach (tis_warm_countries() as $country) {
-        foreach (tis_warm_slabs() as $weight) {
+    foreach ($provider->warm_lanes() as $lane) {
 
-            $result = TIS_API::request($country, $weight, 0, $token, $timeout);
+        $destination = isset($lane['destination']) ? (array) $lane['destination'] : [];
+        $weight      = isset($lane['weight']) ? (float) $lane['weight'] : 0.5;
+        $opts        = ['cod' => !empty($lane['cod'])];
 
-            if (!empty($result['error'])) {
-                $summary['failed']++;
-                $key = $country . ' @ ' . $weight . 'kg: ' . $result['error'];
-                if (count($summary['errors']) < 5) {
-                    $summary['errors'][] = $key;
-                }
-            } elseif (empty($result['rates'])) {
-                // Cache the empty result too, briefly, so a dead lane does not
-                // trigger a live call on every checkout render.
-                TIS_API::set_cached($country, $weight, 0, [], HOUR_IN_SECONDS);
-                $summary['empty']++;
-            } else {
-                TIS_API::set_cached($country, $weight, 0, $result['rates']);
-                $summary['ok']++;
+        $result = $provider->request($destination, $weight, $opts, $token, $timeout);
+
+        if (!empty($result['error'])) {
+
+            $summary['failed']++;
+
+            if (count($summary['errors']) < 5) {
+                $summary['errors'][] = sprintf(
+                    '%s @ %skg: %s',
+                    isset($destination['country']) ? $destination['country'] : '?',
+                    $weight,
+                    $result['error']
+                );
             }
 
-            if ($delay_us > 0) {
-                usleep($delay_us);
-            }
+        } elseif (empty($result['rates'])) {
+
+            // Cache the empty result too, briefly, so a dead lane does not
+            // trigger a live call on every checkout render.
+            $provider->set_cached($destination, $weight, $opts, [], HOUR_IN_SECONDS);
+            $summary['empty']++;
+
+        } else {
+
+            $provider->set_cached($destination, $weight, $opts, $result['rates']);
+            $summary['ok']++;
+        }
+
+        if ($delay_us > 0) {
+            usleep($delay_us);
         }
     }
 
     update_option('tis_last_warm', [
-        'time'    => time(),
-        'summary' => $summary,
+        'time'     => time(),
+        'provider' => $provider->id(),
+        'summary'  => $summary,
     ], false);
 
-    tis_log('info', 'Shiprocket rate warm finished.', $summary);
+    tis_log('info', 'Rate warm finished.', $summary + ['provider' => $provider->id()]);
 
     return $summary;
 }

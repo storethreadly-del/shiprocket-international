@@ -38,7 +38,12 @@ function tis_handle_settings_post(&$probe) {
 
     check_admin_referer('tis_settings');
 
-    $action = sanitize_key(wp_unslash($_POST['tis_action']));
+    $action   = sanitize_key(wp_unslash($_POST['tis_action']));
+    $provider = TS_Provider_Registry::active();
+
+    if (!$provider) {
+        return '<div class="notice notice-error"><p>' . esc_html__('No shipping provider is registered.', 'threadly-intl-shipping') . '</p></div>';
+    }
 
     if ('save' === $action) {
 
@@ -50,8 +55,8 @@ function tis_handle_settings_post(&$probe) {
         $password = (string) wp_unslash($_POST['tis_sr_password'] ?? '');
         if ('' !== $password) {
             update_option('tis_sr_password', $password);
-            TIS_Auth::clear_failures();
-            delete_transient(TIS_Auth::TOKEN_KEY);
+            $provider->clear_failures();
+            $provider->forget_token();
         }
 
         update_option('tis_pickup_pincode', sanitize_text_field(wp_unslash($_POST['tis_pickup_pincode'] ?? '')));
@@ -64,19 +69,19 @@ function tis_handle_settings_post(&$probe) {
 
     if ('clear_credentials' === $action) {
         delete_option('tis_sr_password');
-        delete_transient(TIS_Auth::TOKEN_KEY);
-        TIS_Auth::clear_failures();
+        $provider->forget_token();
+        $provider->clear_failures();
         return '<div class="notice notice-success is-dismissible"><p>' . esc_html__('Stored Shiprocket password cleared.', 'threadly-intl-shipping') . '</p></div>';
     }
 
     if ('clear_token' === $action) {
-        TIS_Auth::forget();
+        $provider->forget_token();
         return '<div class="notice notice-success is-dismissible"><p>' . esc_html__('Cached Shiprocket token cleared. The next warm or test will re-authenticate.', 'threadly-intl-shipping') . '</p></div>';
     }
 
     if ('test_connection' === $action) {
 
-        $result = TIS_Auth::test_connection();
+        $result = $provider->test_connection();
 
         if (is_array($result) && isset($result['error'])) {
             return '<div class="notice notice-error"><p><strong>' . esc_html__('Connection test failed:', 'threadly-intl-shipping') . '</strong> '
@@ -113,14 +118,20 @@ function tis_handle_settings_post(&$probe) {
         $country = strtoupper(sanitize_text_field(wp_unslash($_POST['tis_probe_country'] ?? 'US')));
         $weight  = (float) ($_POST['tis_probe_weight'] ?? 0.5);
 
-        $token = TIS_API::background_token();
+        $token = $provider->token();
 
         if (is_array($token) && isset($token['error'])) {
             return '<div class="notice notice-error"><p>' . esc_html__('Authentication failed: ', 'threadly-intl-shipping')
                 . esc_html($token['error']) . '</p></div>';
         }
 
-        $probe = TIS_API::request($country, $weight, 0, $token, 30);
+        $probe = $provider->request(
+            ['country' => $country, 'postcode' => ''],
+            $weight,
+            ['cod' => false],
+            $token,
+            30
+        );
         $probe['country'] = $country;
         $probe['weight']  = $weight;
 
@@ -139,8 +150,17 @@ function tis_render_settings_page() {
     $probe  = null;
     $notice = tis_handle_settings_post($probe);
 
-    $last   = get_option('tis_last_warm', []);
-    $status = TIS_Auth::status();
+    $last     = get_option('tis_last_warm', []);
+    $provider = TS_Provider_Registry::active();
+
+    if (!$provider) {
+        echo '<div class="wrap"><div class="notice notice-error"><p>'
+            . esc_html__('No shipping provider is registered.', 'threadly-intl-shipping')
+            . '</p></div></div>';
+        return;
+    }
+
+    $status = $provider->auth_status();
 
     ?>
     <div class="wrap">
@@ -176,7 +196,7 @@ function tis_render_settings_page() {
             </div>
         <?php endif; ?>
 
-        <?php if (TIS_API::circuit_is_open()) : ?>
+        <?php if ($provider->circuit_is_open()) : ?>
             <div class="notice notice-warning">
                 <p><?php esc_html_e('The rate-fetch circuit breaker is currently open — live calls are paused after a failure. Cached and fallback rates are still being served. Running a warm below will reset it.', 'threadly-intl-shipping'); ?></p>
             </div>
@@ -188,7 +208,7 @@ function tis_render_settings_page() {
                 <tr>
                     <td style="width:220px"><strong><?php esc_html_e('Last successful request', 'threadly-intl-shipping'); ?></strong></td>
                     <td>
-                        <?php $ok = get_option('tis_last_success'); ?>
+                        <?php $ok = $provider->last_success(); ?>
                         <?php if (!empty($ok['time'])) : ?>
                             <?php
                             printf(
@@ -208,7 +228,7 @@ function tis_render_settings_page() {
                 <tr>
                     <td><strong><?php esc_html_e('Last API error', 'threadly-intl-shipping'); ?></strong></td>
                     <td>
-                        <?php $err = get_option('tis_last_error'); ?>
+                        <?php $err = $provider->last_error(); ?>
                         <?php if (!empty($err['time'])) : ?>
                             <?php
                             printf(

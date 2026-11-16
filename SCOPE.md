@@ -27,11 +27,25 @@ name and description change.
 Introduce one interface, two implementations:
 
 ```
-includes/providers/interface-ts-provider.php
-includes/providers/class-ts-provider-shiprocket.php   <- refactor of class-tis-api.php + class-tis-auth.php
-includes/providers/class-ts-provider-icarry.php       <- new
-includes/class-ts-provider-registry.php               <- active-provider resolution
+includes/class-ts-http.php                            <- transport seam (done)
+includes/class-ts-logger.php                          <- logging seam (done)
+includes/providers/interface-ts-provider.php          <- the contract (done)
+includes/providers/abstract-class-ts-provider-base.php<- shared machinery (done)
+includes/providers/class-ts-provider-shiprocket.php   <- refactor of class-tis-api.php + class-tis-auth.php (done)
+includes/providers/class-ts-provider-icarry.php       <- new, phase 3
+includes/class-ts-provider-registry.php               <- active-provider resolution (done)
 ```
+
+Shared machinery — the cache-only checkout token rule, the login mutex, the
+consecutive-failure lockout, the circuit breaker, the rate cache and the
+diagnostics counters — lives in `TS_Provider_Base` so iCarry inherits it rather
+than reimplementing it. Storage keys are indirected through `key()`, which is
+how the Shiprocket provider keeps every v0.2.0 option and transient name: a
+rename would orphan stored credentials and discard a warm token and cache.
+
+`TIS_Auth` and `TIS_API` survive as deprecated shims over the Shiprocket
+provider, so site-level and third-party callers keep working. Nothing inside the
+plugin uses them any more.
 
 Interface surface (each provider declares its own capabilities):
 
@@ -195,7 +209,7 @@ Until step 3, every estimate below is provisional.
 | Phase | Work | Est. |
 |-------|------|------|
 | 0 | iCarry API discovery + probe harness | 0.5–1 d |
-| 1 | Provider interface; refactor Shiprocket behind it (no behaviour change) | 1.5–2 d |
+| 1 | ~~Provider interface; refactor Shiprocket behind it (no behaviour change)~~ **done** | 1.5–2 d |
 | 2 | Active-provider setting, switch lifecycle, admin UI | 1 d |
 | 3 | iCarry rate provider — international | 1–1.5 d |
 | 4 | Domestic lane: pincode cache policy, volume-based warming, COD | 1.5–2 d |
@@ -211,7 +225,55 @@ which is the safe first merge.
 
 ---
 
-## 9. Risks
+## 9. Phase 1 as built
+
+Landed: the two injection seams, the provider contract, the shared base, the
+Shiprocket provider, the registry, and the deprecated shims. Consumers were
+moved onto the contract: the shipping method, the warmer and the settings screen
+all now talk to `TS_Provider_Registry::active()`.
+
+Two changes above the provider layer are worth calling out:
+
+- The hardcoded `'IN' === $country` guard in `calculate_shipping()` is gone,
+  replaced by `$provider->serves($destination)`. Shiprocket declares
+  `domestic => false`, so the behaviour is identical today — but whether India is
+  in scope is now a property of the active provider rather than a constant of
+  the plugin, which is what phase 4 needs.
+- The warmer no longer computes `countries × slabs` itself; it asks the provider
+  for `warm_lanes()`. That is the hook domestic warming needs, since it cannot
+  enumerate its lanes the same way.
+
+Rate rows gained `provider`, `service_type` and `cod_available`; rate meta gained
+`tis_provider` and `tis_service_type`, so a shipment can later be synced against
+the aggregator that actually quoted it.
+
+**Verification.** `tests/smoke-provider.php` is a standalone harness — no
+PHPUnit, no WordPress, no network — run with `php tests/smoke-provider.php`
+(89 checks). It pins the behaviour that the refactor had to preserve:
+
+- cache keys are byte-identical to the v0.2.0 md5 formula, checked against a
+  verbatim copy of it, so upgrading inherits the warm cache instead of going
+  cold;
+- every legacy storage key still resolves to its v0.2.0 name;
+- `serves()` reproduces the old country guard exactly, India included;
+- checkout serves nothing and makes **no** HTTP call when no warm token exists —
+  the rule that it must never log in on a customer's thread;
+- the lockout trips after three rejections and then makes no further calls, and
+  an open circuit suppresses live rating;
+- the deprecated shims still delegate correctly.
+
+That the harness needs no WordPress is itself the check on seam 3 of §6: if a
+provider ever picks up a framework dependency, this is where it surfaces.
+
+**Seam left open.** Storage is still WordPress-native (`get_transient`,
+`get_option`). Every read and write funnels through four methods on
+`TS_Provider_Base` (`cache_get`, `cache_set`, `state_get`, `state_set`), so
+abstracting it later is a change to those four rather than a hunt through the
+class. HTTP and logging are already injected.
+
+---
+
+## 10. Risks
 
 - **iCarry contract unknown.** Biggest unknown; phase 0 exists to retire it.
 - **Domestic cache cannot be fully warmed.** Mitigated by top-N warming + a bounded

@@ -266,23 +266,89 @@ envelopes. iCarry publishes endpoint *names* only — the list is a plain `<li>`
 list with no links, no schemas and no examples. The detail is behind account
 login or a support ticket.
 
-**Two ways to close it:**
+### ⚠️ The wordpress.org "iCARRY" plugin is a DIFFERENT COMPANY — do not use it
 
-- **The open-source connector.** iCarry's own WooCommerce plugin is published on
-  wordpress.org, so its source contains the real paths, parameters and envelopes
-  — verified facts, no credentials needed, no guessing. This is the preferred
-  route. It needs `downloads.wordpress.org` / `plugins.svn.wordpress.org`
-  reachable *and* permission to fetch from them; the hosts are now allowed but
-  the fetch itself was refused by the session's permission classifier.
-- **The account.** Log in to iCarry, generate the API key, and share whatever
-  documentation the API Credentials screen links to. (The key itself goes in the
-  plugin's settings screen or a wp-config constant — not into chat.)
+The obvious route to the contract was iCarry's open-source WooCommerce connector
+on wordpress.org. It was downloaded and read. **It is not this vendor.**
 
-Once either lands, the remaining work is as before: extend the admin probe to
-target iCarry, dump raw JSON per endpoint, and pin the findings into the
-provider's CONTRACT block exactly as `class-ts-provider-shiprocket.php` does.
-Until then, phase 3 would be writing code against guesses, which is the one thing
-this project has consistently refused to do.
+The plugin at `wordpress.org/plugins/icarry/` targets **iCarry.com**, a Middle
+East shipping company. Evidence, from the plugin source:
+
+- Its only store options are `https://lb.icarry.com/` (Lebanon),
+  `https://uae.icarry.com/`, `https://kw.icarry.com/` (Kuwait) and
+  `https://ksa.icarry.com/` (Saudi Arabia).
+- Ten references to `icarry.com`, **zero** to `icarry.in`.
+- `readme.txt` points at `icarry.com/terms`, `icarry.com/privacy` and
+  `developer.icarry.com` — so that developer portal is also the wrong entity.
+- **No pincode concept anywhere in the codebase.** It geocodes street + city
+  through the Google Maps API, which is Middle East addressing, not Indian.
+
+Its contract — `api-frontend/Authenticate/GetTokenForCustomerApi`,
+`api-frontend/SmartwareShipment/EstimateRatesByCOD`,
+`api-frontend/SmartwareShipment/CreateOrder`, bearer token, PascalCase JSON
+(`Email`, `Password`, `Name`, `TrackingNumber`) — belongs to that company and
+must **not** be used here. Building the provider on it would have produced
+something that authenticated against the wrong vendor entirely while looking
+perfectly plausible in review.
+
+(Two further reasons not to treat that plugin as a reference even by analogy: it
+sends `sslverify => false` on every call, and it keeps the account password in
+plain WooCommerce settings. Neither is acceptable here.)
+
+An earlier web search had flagged exactly this risk — a forum post linking
+`developer.icarry.com` for "iCARRY", with a note that it looked like a UAE
+company. That hunch is now confirmed fact.
+
+### No public contract for iCarry.in
+
+Checked and ruled out: `/api`, `/api-docs`, `/docs`, `/pages/api.html`,
+`/pages/api-documentation.html`, `/pages/developer.html`,
+`/pages/shipping-api.html` — all resolve to the homepage or a soft-404. The
+endpoint list on the APIs page is a plain `<li>` list with no links, schemas or
+examples. The per-platform setup guides are videos with no transcript.
+
+**So the contract has to come from the account:**
+
+- **Preferred — the API Credentials screen.** My Account → API Credentials →
+  Generate Key. Share whatever documentation that screen links to (paths,
+  parameters, sample payloads). The key itself goes in the plugin's settings
+  screen or a wp-config constant, never into chat.
+- **Or a support ticket.** iCarry's own APIs page invites this, and support is
+  reachable at the ticket desk once registered.
+
+Once either lands: extend the admin probe to target iCarry, dump raw JSON per
+endpoint, and pin the findings into the provider's CONTRACT block exactly as
+`class-ts-provider-shiprocket.php` does. Until then, phase 3 would be writing
+code against guesses — which, as the section above shows, is not a theoretical
+risk here.
+
+### A finding that may shrink phase 5
+
+iCarry.in already ships a **pull-based** WooCommerce connector: you give iCarry
+your store's API credentials, and *iCarry* syncs your orders into *its* dashboard
+("orders appear in your iCarry dashboard where you can book shipments
+individually or in bulk"). Same model as their Zoho connector.
+
+That is most of the "sync orders to the iCarry dashboard" requirement, available
+with no code at all. What it does **not** appear to give:
+
+- AWB, tracking and label written **back** into WooCommerce;
+- rates at WooCommerce checkout (that is what this plugin's provider adds);
+- an event stream the HIE tool can consume (§6).
+
+So there is a real choice to make before phase 5 is scoped:
+
+| | Their native connector | Our push sync (phase 5) |
+|---|---|---|
+| Orders in iCarry dashboard | ✅ no code | ✅ |
+| Rates at checkout | ❌ | ✅ (phases 3–4) |
+| AWB/tracking back into Woo | ❌ | ✅ |
+| Events for HIE | ❌ | ✅ |
+| Build cost | zero | 2–3 d + 1.5–2 d |
+
+Recommendation: use their native connector for dashboard visibility immediately,
+and keep phase 5 scoped to what it uniquely buys — write-back and the HIE event
+stream — rather than duplicating order delivery.
 
 ---
 
@@ -419,6 +485,11 @@ that notices follow the active provider.
   URL, exact paths, auth scheme, parameter names and response envelopes — enough
   to block writing the provider, but no longer enough to put the shape of the
   plan in doubt.
+- **Name collision with a different company.** `iCarry.com` is an unrelated
+  Middle East shipping company with its own API and its own WooCommerce plugin.
+  Any future contributor reaching for "the iCarry docs" or "the iCarry plugin"
+  will most likely find that one first. §7 records the distinguishing evidence;
+  the provider's CONTRACT block should name `icarry.in` explicitly.
 - **Domestic cache cannot be fully warmed.** Mitigated by top-N warming plus a
   bounded live call — decided, see §4. Domestic checkout will still be measurably
   slower than international on a cold lane; the mitigation is a per-provider

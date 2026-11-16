@@ -158,20 +158,6 @@ class TS_Provider_Shiprocket extends TS_Provider_Base {
     }
 
     /**
-     * Configured pickup pincode, falling back to the WooCommerce store postcode.
-     */
-    public function pickup_pincode() {
-
-        $pin = trim((string) get_option('tis_pickup_pincode', ''));
-
-        if ('' === $pin) {
-            $pin = trim((string) get_option('woocommerce_store_postcode', ''));
-        }
-
-        return $pin;
-    }
-
-    /**
      * Value to send as the destination country.
      *
      * WooCommerce hands us an ISO-2 code. Shiprocket may want the full country
@@ -255,21 +241,6 @@ class TS_Provider_Shiprocket extends TS_Provider_Base {
         }
 
         return $lanes;
-    }
-
-    /** @return string[] ISO-2 codes. */
-    public function warm_countries() {
-        $raw  = (string) get_option('tis_warm_countries', 'US,GB,AE,AU,CA,SG');
-        $list = array_filter(array_map('trim', explode(',', strtoupper($raw))));
-        return array_values(array_unique($list));
-    }
-
-    /** @return float[] Weight slabs in kg. */
-    public function warm_slabs() {
-        $raw  = (string) get_option('tis_warm_slabs', '0.5,1,1.5,2,2.5,3,4,5');
-        $list = array_filter(array_map('floatval', array_map('trim', explode(',', $raw))));
-        sort($list);
-        return array_values(array_unique($list));
     }
 
     /**
@@ -371,6 +342,8 @@ class TS_Provider_Shiprocket extends TS_Provider_Base {
                 'provider'      => $this->id(),
                 'service_type'  => $service,
                 'cod_available' => !empty($row['cod']),
+                'rto_charge'    => null,
+                'delivery_rate' => null,
             ];
         }
 

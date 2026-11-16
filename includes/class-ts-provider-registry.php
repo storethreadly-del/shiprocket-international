@@ -54,6 +54,8 @@ class TS_Provider_Registry {
             self::register(new TS_Provider_Shiprocket($http, new TS_Logger_WC('tis-shiprocket')));
         }
 
+        self::register_optional_providers($http);
+
         /**
          * Register additional providers.
          *
@@ -62,6 +64,28 @@ class TS_Provider_Registry {
          * @param TS_Http              $http
          */
         do_action('ts_register_providers', $http);
+    }
+
+    /**
+     * Providers that only appear once they can be used.
+     *
+     * iCarry is registered only when its credentials exist. That keeps a store that
+     * has never configured it from seeing a provider it cannot use, and from being
+     * able to switch checkout onto one that has never authenticated.
+     *
+     * Public so the iCarry screen can call it straight after saving credentials,
+     * when the registry has already booted without it.
+     */
+    public static function register_optional_providers(?TS_Http $http = null) {
+
+        if (isset(self::$providers['icarry'])
+            || !class_exists('TS_Provider_ICarry')
+            || !class_exists('TS_ICarry_Credentials')
+            || !TS_ICarry_Credentials::exists()) {
+            return;
+        }
+
+        self::register(new TS_Provider_ICarry($http ?: new TS_Http_WP(), new TS_Logger_WC('tis-icarry')));
     }
 
     public static function register(TS_Provider $provider) {
@@ -231,6 +255,12 @@ class TS_Provider_Registry {
         }
 
         self::reschedule_warm();
+
+        // The incoming provider may need its token kept fresh in the background
+        // (iCarry's lives for an hour); the outgoing one may no longer.
+        if (function_exists('tis_sync_token_refresh_schedule')) {
+            tis_sync_token_refresh_schedule();
+        }
 
         $warnings = [];
 

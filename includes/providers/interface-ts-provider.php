@@ -12,7 +12,7 @@
  *
  * Every provider returns rows of exactly this shape from rates() and request().
  * The first five keys are carried over verbatim from v0.2.0 so that existing
- * code and stored rate meta keep working; the last three are new in 0.3.0.
+ * code and stored rate meta keep working; the rest are newer.
  *
  *   courier_id     string  Provider's courier identifier, or a slug of the name.
  *   courier_name   string  Display name.
@@ -25,6 +25,12 @@
  *                          switched (SCOPE.md §3).
  *   service_type   string  e.g. surface/air/express, or '' when not reported.
  *   cod_available  bool    Whether this courier will collect on delivery.
+ *   rto_charge     float   Charge if the parcel is returned to origin, or null
+ *                          when the aggregator does not say. Matters for COD,
+ *                          where return-to-origin is a real cost.
+ *   delivery_rate  float   Courier's delivery success rate, 0-100, or null.
+ *
+ * transit_days and edd may be null: iCarry's estimate carries neither.
  * ---------------------------------------------------------------------------
  *
  * DESTINATION ARRAY

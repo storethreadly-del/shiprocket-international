@@ -45,7 +45,33 @@ function tis_handle_icarry_post($transport = null) {
             delete_transient(TS_ICarry_Probe::BLOCK_KEY);
         }
 
-        return ['<div class="notice notice-success is-dismissible"><p>' . esc_html__('iCarry credentials saved.', 'threadly-intl-shipping') . '</p></div>', null];
+        $modes = array_values(array_unique(array_filter(
+            array_map('trim', explode(',', strtoupper((string) wp_unslash($_POST['tis_ic_modes'] ?? 'S')))),
+            function ($m) { return in_array($m, ['S', 'E', 'H'], true); }
+        )));
+        update_option('tis_ic_modes', $modes ? implode(',', $modes) : 'S');
+        update_option('tis_ic_include_gst', empty($_POST['tis_ic_include_gst']) ? 'no' : 'yes');
+
+        // The registry has already booted without iCarry if this is the first save.
+        TS_Provider_Registry::register_optional_providers();
+
+        return ['<div class="notice notice-success is-dismissible"><p>' . esc_html__('iCarry settings saved.', 'threadly-intl-shipping') . '</p></div>', null];
+    }
+
+    if ('verify' === $action) {
+
+        TS_Provider_Registry::register_optional_providers();
+        $provider = TS_Provider_Registry::get('icarry');
+
+        if (!$provider) {
+            return ['<div class="notice notice-error"><p>' . esc_html__('Save the iCarry credentials first.', 'threadly-intl-shipping') . '</p></div>', null];
+        }
+
+        return ['', tis_icarry_verify(
+            $provider,
+            sanitize_text_field(wp_unslash($_POST['tis_ic_v_pincode'] ?? '')),
+            strtoupper(sanitize_text_field(wp_unslash($_POST['tis_ic_v_country'] ?? 'US')))
+        )];
     }
 
     if ('clear' === $action) {
@@ -72,6 +98,62 @@ function tis_handle_icarry_post($transport = null) {
     }
 
     return ['', null];
+}
+
+/**
+ * Exercise the real provider against the live service: log in, then one domestic
+ * and one international estimate. Read-only: estimates book nothing and spend
+ * nothing. Reports what came back so the unverified parts of the contract
+ * (session cookie, GST handling, token separator) can be settled from evidence.
+ *
+ * @return array
+ */
+function tis_icarry_verify(TS_Provider $provider, $dest_pincode, $country) {
+
+    $report = ['note' => 'Read-only: estimates only, nothing is booked or charged.', 'steps' => []];
+
+    $t0    = microtime(true);
+    $token = $provider->test_connection();
+    $ms    = (int) round((microtime(true) - $t0) * 1000);
+
+    if (is_array($token) && isset($token['error'])) {
+        $report['steps'][] = ['step' => 'login', 'ok' => false, 'ms' => $ms, 'error' => $token['error']];
+        $report['stopped'] = 'Login failed, so no estimate was attempted. If the error mentions an IP address, add this server\'s outbound IP to the allow-list in your iCarry account.';
+        return $report;
+    }
+
+    $report['steps'][] = ['step' => 'login', 'ok' => true, 'ms' => $ms];
+
+    $lanes = [];
+    if (preg_match('/^\d{6}$/', $dest_pincode)) {
+        $lanes['domestic'] = ['country' => 'IN', 'postcode' => $dest_pincode];
+    }
+    if ('' !== $country && 'IN' !== $country) {
+        $lanes['international'] = ['country' => $country, 'postcode' => ''];
+    }
+
+    foreach ($lanes as $label => $destination) {
+
+        $t0 = microtime(true);
+        $r  = $provider->request($destination, 0.5, ['cod' => false, 'value' => 0], $token, 20);
+        $ms = (int) round((microtime(true) - $t0) * 1000);
+
+        $report['steps'][] = [
+            'step'     => $label . ' estimate',
+            'ok'       => empty($r['error']),
+            'ms'       => $ms,
+            'error'    => $r['error'] ?? null,
+            'couriers' => count($r['rates'] ?? []),
+            'cheapest' => !empty($r['rates']) ? $r['rates'][0] : null,
+            'raw'      => substr((string) wp_json_encode($r['raw'] ?? null), 0, 1500),
+        ];
+    }
+
+    if (!$lanes) {
+        $report['steps'][] = ['step' => 'estimates', 'ok' => false, 'error' => 'Enter a six-digit pincode and/or a country to estimate.'];
+    }
+
+    return $report;
 }
 
 function tis_render_icarry_probe_page() {
@@ -108,10 +190,33 @@ function tis_render_icarry_probe_page() {
                         <p class="description"><?php esc_html_e('Prefer wp-config.php constants TIS_IC_USER and TIS_IC_PASSWORD to keep this out of the database.', 'threadly-intl-shipping'); ?></p></td></tr>
                 <?php endif; ?>
             </table>
+            <h2><?php esc_html_e('Rating', 'threadly-intl-shipping'); ?></h2>
+            <table class="form-table" role="presentation">
+                <tr><th><label for="tis_ic_modes"><?php esc_html_e('Domestic modes to quote', 'threadly-intl-shipping'); ?></label></th>
+                    <td><input name="tis_ic_modes" id="tis_ic_modes" type="text" class="small-text" value="<?php echo esc_attr(get_option('tis_ic_modes', 'S')); ?>">
+                        <p class="description"><?php esc_html_e('S = surface, E = express/air, H = hyperlocal. Comma-separated. Each mode is one extra call on a cold lane, so S alone is the fastest.', 'threadly-intl-shipping'); ?></p></td></tr>
+                <tr><th><?php esc_html_e('GST', 'threadly-intl-shipping'); ?></th>
+                    <td><label><input name="tis_ic_include_gst" type="checkbox" value="1" <?php checked('no' !== get_option('tis_ic_include_gst', 'yes')); ?>>
+                        <?php esc_html_e('Add the GST figure to the quoted rate', 'threadly-intl-shipping'); ?></label>
+                        <p class="description"><?php esc_html_e('iCarry returns GST as a separate figure. Leave this on until a real shipment shows the wallet is charged the rate without it.', 'threadly-intl-shipping'); ?></p></td></tr>
+            </table>
+
             <?php if ('wp-config' !== $creds['source']) : ?>
                 <p><button type="submit" name="tis_ic_action" value="save" class="button button-primary"><?php esc_html_e('Save', 'threadly-intl-shipping'); ?></button>
                    <button type="submit" name="tis_ic_action" value="clear" class="button"><?php esc_html_e('Clear stored password', 'threadly-intl-shipping'); ?></button></p>
+            <?php else : ?>
+                <p><button type="submit" name="tis_ic_action" value="save" class="button button-primary"><?php esc_html_e('Save rating settings', 'threadly-intl-shipping'); ?></button></p>
             <?php endif; ?>
+
+            <h2><?php esc_html_e('Verify against the live service', 'threadly-intl-shipping'); ?></h2>
+            <p class="description"><?php esc_html_e('Logs in, then asks for one domestic and one international estimate. Read-only: nothing is booked or charged. iCarry can restrict API access by IP, so run this from this server.', 'threadly-intl-shipping'); ?></p>
+            <table class="form-table" role="presentation">
+                <tr><th><label for="tis_ic_v_pincode"><?php esc_html_e('Destination pincode', 'threadly-intl-shipping'); ?></label></th>
+                    <td><input name="tis_ic_v_pincode" id="tis_ic_v_pincode" type="text" class="small-text" maxlength="6" placeholder="560001"></td></tr>
+                <tr><th><label for="tis_ic_v_country"><?php esc_html_e('Destination country', 'threadly-intl-shipping'); ?></label></th>
+                    <td><input name="tis_ic_v_country" id="tis_ic_v_country" type="text" class="small-text" maxlength="2" value="US"></td></tr>
+            </table>
+            <p><button type="submit" name="tis_ic_action" value="verify" class="button button-primary"><?php esc_html_e('Run verification', 'threadly-intl-shipping'); ?></button></p>
 
             <h2><?php esc_html_e('Request', 'threadly-intl-shipping'); ?></h2>
             <table class="form-table" role="presentation">

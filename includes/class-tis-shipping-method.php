@@ -224,7 +224,11 @@ add_action('woocommerce_shipping_init', function () {
             // serves them is active (SCOPE.md §4).
             $cod = (bool) apply_filters('ts_rate_request_cod', false, $package, $provider);
 
-            $rates = $provider->rates($destination, $weight, ['cod' => $cod]);
+            $rates = $provider->rates($destination, $weight, [
+                'cod'   => $cod,
+                // Used only by a provider whose price depends on declared value.
+                'value' => isset($package['contents_cost']) ? (float) $package['contents_cost'] : 0.0,
+            ]);
 
             if (empty($rates)) {
                 $this->add_fallback_rate($package);

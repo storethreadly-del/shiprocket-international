@@ -19,7 +19,7 @@ while IFS= read -r f; do
 done < <(find . -name '*.php' -not -path './.git/*')
 echo "  $found file(s) OK"
 
-for harness in tests/smoke-provider.php tests/smoke-settings-page.php tests/smoke-icarry-probe.php; do
+for harness in tests/smoke-provider.php tests/smoke-settings-page.php tests/smoke-icarry-probe.php tests/smoke-icarry-provider.php; do
     echo
     echo "== $harness =="
     php "$harness"

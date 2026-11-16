@@ -13,9 +13,20 @@ require __DIR__ . '/wp-stubs.php';
 require __DIR__ . '/admin-stubs.php';
 
 $root = dirname(__DIR__);
+require $root . '/includes/class-ts-http.php';
+require __DIR__ . '/class-ts-http-fake.php';
+require $root . '/includes/class-ts-logger.php';
+require $root . '/includes/providers/interface-ts-provider.php';
+require $root . '/includes/providers/abstract-class-ts-provider-base.php';
+require $root . '/includes/providers/class-ts-provider-shiprocket.php';
 require $root . '/includes/class-ts-icarry-credentials.php';
+require $root . '/includes/providers/class-ts-provider-icarry.php';
+require $root . '/includes/class-ts-provider-registry.php';
+require __DIR__ . '/class-ts-provider-fake.php';
 require $root . '/includes/class-ts-icarry-probe.php';
 require $root . '/includes/icarry-probe-page.php';
+
+class TS_Provider_ICarry_Test extends TS_Provider_ICarry { use TS_Test_Memory_Flush; }
 
 error_reporting(E_ALL);
 set_error_handler(function ($no, $str, $file, $line) {
@@ -24,6 +35,7 @@ set_error_handler(function ($no, $str, $file, $line) {
 
 $pass = 0; $fail = 0;
 function ok($l, $c, $d = '') { global $pass, $fail; if ($c) { $pass++; echo "  \033[32mPASS\033[0m  $l\n"; } else { $fail++; echo "  \033[31mFAIL\033[0m  $l" . ($d ? "\n          $d" : '') . "\n"; } }
+function is_same($l, $a, $e) { ok($l, $a === $e, 'expected ' . var_export($e, true) . ', got ' . var_export($a, true)); }
 function section($t) { echo "\n\033[1m$t\033[0m\n"; }
 
 const PW = 'S3cret-API-pass';
@@ -148,6 +160,69 @@ $_POST = ['tis_ic_action' => 'probe', 'tis_ic_url' => 'https://icarry.com/x', 't
 list(, $res) = tis_handle_icarry_post($transport);
 ok('probe via the screen enforces the allow-list', !empty($res['error']));
 $_POST = [];
+
+section('Rating settings');
+$GLOBALS['_options'] = ['tis_ic_user' => USR, 'tis_ic_password' => PW];
+TS_Provider_Registry::reset();
+$_POST = ['tis_ic_action' => 'save', 'tis_ic_user' => USR, 'tis_ic_password' => '', 'tis_ic_modes' => 'S, e, x, h, S', 'tis_ic_include_gst' => '1'];
+tis_handle_icarry_post();
+is_same('modes are sanitised, de-duplicated and upper-cased', get_option('tis_ic_modes'), 'S,E,H');
+is_same('GST on', get_option('tis_ic_include_gst'), 'yes');
+$_POST = ['tis_ic_action' => 'save', 'tis_ic_user' => USR, 'tis_ic_password' => '', 'tis_ic_modes' => 'zzz'];
+tis_handle_icarry_post();
+is_same('nonsense modes fall back to surface', get_option('tis_ic_modes'), 'S');
+is_same('an unticked GST box means off', get_option('tis_ic_include_gst'), 'no');
+ok('saving registers the iCarry provider straight away', TS_Provider_Registry::exists('icarry'));
+
+section('Live verification action');
+$_POST = ['tis_ic_action' => 'verify', 'tis_ic_v_pincode' => '628008', 'tis_ic_v_country' => 'US'];
+
+$GLOBALS['_options'] = [];
+TS_Provider_Registry::reset();
+list($notice, $res) = tis_handle_icarry_post();
+ok('refuses without credentials', false !== strpos($notice, 'Save the iCarry credentials first') && null === $res);
+
+$GLOBALS['_options'] = ['tis_ic_user' => USR, 'tis_ic_password' => PW, 'tis_pickup_pincode' => '642001'];
+$GLOBALS['_transients'] = [];
+$vh = new TS_Http_Fake();
+TS_Provider_Registry::reset();
+TS_Provider_Registry::register(new TS_Provider_ICarry_Test($vh, new TS_Logger_Null()));
+
+$vh->push(['code' => 200, 'body' => ['error' => ['ip' => 'Your IP 203.0.113.9 is not allowed to access this API!']]]);
+list(, $res) = tis_handle_icarry_post();
+ok('a failed login is reported and stops there', false === $res['steps'][0]['ok'] && 1 === count($res['steps']));
+ok('with advice about the IP allow-list', !empty($res['stopped']) && false !== strpos($res['stopped'], 'allow-list'));
+$GLOBALS['_transients'] = [];
+
+$vh->push(['code' => 200, 'body' => ['api_token' => 'TOK123'], 'cookies' => ['OCSESSID' => 'S1']]);
+$vh->push(['code' => 200, 'body' => ['success' => 1, 'error' => '', 'estimate' => ['A' => ['courier_name' => 'A', 'courier_id' => '1', 'courier_cost' => '50', 'cod_cost' => '0', 'freight_cost' => '50', 'rto_cost' => '50', 'gst' => '9']]]]);
+$vh->push(['code' => 200, 'body' => ['success' => 1, 'estimates' => [['courier_name' => 'B', 'courier_id' => '2-3', 'total' => 900]]]]);
+list(, $res) = tis_handle_icarry_post();
+is_same('login + domestic + international', array_column($res['steps'], 'step'), ['login', 'domestic estimate', 'international estimate']);
+ok('all steps ok', !in_array(false, array_column($res['steps'], 'ok'), true));
+is_same('domestic cheapest reported', $res['steps'][1]['cheapest']['courier_name'], 'A');
+is_same('international cheapest reported', $res['steps'][2]['cheapest']['rate'], 900.0);
+ok('timings are recorded', isset($res['steps'][0]['ms']));
+ok('the report never contains the key or the token', false === strpos(json_encode($res), PW) && false === strpos(json_encode($res), 'TOK123'));
+ok('it is described as read-only', false !== strpos($res['note'], 'nothing is booked'));
+$sent = array_column($vh->requests, 'url');
+ok('only estimate endpoints were called, never a booking one', !array_filter($sent, function ($u) { return false !== strpos($u, 'add_shipment') || false !== strpos($u, 'cancel') || false !== strpos($u, 'reverse'); }));
+
+$_POST = ['tis_ic_action' => 'verify', 'tis_ic_v_pincode' => '', 'tis_ic_v_country' => ''];
+$vh->push(['code' => 200, 'body' => ['api_token' => 'T'], 'cookies' => []]);
+$GLOBALS['_transients'] = [];
+list(, $res) = tis_handle_icarry_post();
+ok('nothing to estimate is explained, not silently skipped', false !== strpos(json_encode($res), 'Enter a six-digit pincode'));
+
+section('Screen renders with the new sections');
+$GLOBALS['_options'] = ['tis_ic_user' => USR, 'tis_ic_password' => PW];
+$_POST = [];
+ob_start(); tis_render_icarry_probe_page(); $html = ob_get_clean();
+ok('rating section', false !== strpos($html, 'Domestic modes to quote'));
+ok('GST option', false !== strpos($html, 'Add the GST figure'));
+ok('verification section', false !== strpos($html, 'Verify against the live service') && false !== strpos($html, 'Run verification'));
+ok('IP allow-list is mentioned', false !== strpos($html, 'restrict API access by IP'));
+ok('still never echoes the password', false === strpos($html, PW));
 
 echo "\n" . str_repeat('-', 56) . "\n";
 printf("%d passed, %d failed\n", $pass, $fail);

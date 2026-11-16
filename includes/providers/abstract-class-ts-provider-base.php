@@ -402,7 +402,7 @@ abstract class TS_Provider_Base implements TS_Provider {
             return ['error' => $url['error'], 'rates' => []];
         }
 
-        $response = $this->http->get($url, ['Authorization' => 'Bearer ' . $token], $timeout);
+        $response = $this->send_rate_request($url, $token, $destination, $weight, $opts, $timeout);
 
         $log = [
             'provider'    => $this->id(),
@@ -422,6 +422,23 @@ abstract class TS_Provider_Base implements TS_Provider {
         if (401 === $code) {
             $this->forget_token();
             $this->logger->log('warning', 'Received 401 on a rate request; cached token invalidated.', $log);
+        }
+
+        // Some aggregators report failure inside a 200 response. Treat that as an
+        // error here, once, so it is never mistaken for "no couriers serve this
+        // lane" and cached as an empty result.
+        $body_error = ($code >= 200 && $code < 300) ? $this->body_error($body) : null;
+
+        if (null !== $body_error) {
+
+            if ($this->is_auth_error($body_error)) {
+                $this->forget_token();
+                $this->logger->log('warning', 'Rate request rejected as unauthenticated; cached token invalidated.', $log);
+            }
+
+            $this->logger->log('warning', 'Rate request failed.', $log + ['message' => $body_error]);
+            $this->record_error($destination, $weight, $body_error, $code);
+            return ['error' => $body_error, 'rates' => [], 'raw' => $body, 'url' => $url];
         }
 
         if ($code < 200 || $code >= 300) {
@@ -444,6 +461,84 @@ abstract class TS_Provider_Base implements TS_Provider {
     }
 
     /**
+     * Perform the HTTP call for one rate request.
+     *
+     * The default is a GET carrying the token as a Bearer header, which is what
+     * Shiprocket wants. A provider with a different transport (iCarry takes a
+     * form-encoded POST, with the token in the URL and a session cookie) overrides
+     * this and nothing else about request(), which keeps the logging, error
+     * recording, parsing and token invalidation uniform across providers.
+     *
+     * @return array A TS_Http response.
+     */
+    protected function send_rate_request($url, $token, array $destination, $weight, array $opts, $timeout) {
+        return $this->http->get($url, ['Authorization' => 'Bearer ' . $token], $timeout);
+    }
+
+    /**
+     * An error carried inside an otherwise successful (2xx) response body.
+     *
+     * @param mixed $body Decoded response.
+     * @return string|null The error message, or null when the body is not an error.
+     */
+    protected function body_error($body) {
+        return null;
+    }
+
+    /**
+     * Whether an error message means the cached token is no longer accepted, so
+     * it should be dropped and re-minted by the next background login.
+     *
+     * @param string $message
+     * @return bool
+     */
+    protected function is_auth_error($message) {
+        return false;
+    }
+
+    /**
+     * How often, in seconds, the token needs refreshing in the background; 0 for
+     * none. A provider whose token lives for days (Shiprocket) is kept warm by the
+     * daily rate warm. A short-lived one (iCarry, 60 minutes) needs a dedicated
+     * refresh, because checkout must never log in on a customer's thread and so
+     * can only use a token that a background job already minted.
+     *
+     * @return int
+     */
+    public function refresh_interval() {
+        return 0;
+    }
+
+    /**
+     * Configured pickup pincode, falling back to the WooCommerce store postcode.
+     */
+    public function pickup_pincode() {
+
+        $pin = trim((string) get_option('tis_pickup_pincode', ''));
+
+        if ('' === $pin) {
+            $pin = trim((string) get_option('woocommerce_store_postcode', ''));
+        }
+
+        return $pin;
+    }
+
+    /** @return string[] ISO-2 codes of the destination countries to keep warm. */
+    public function warm_countries() {
+        $raw  = (string) get_option('tis_warm_countries', 'US,GB,AE,AU,CA,SG');
+        $list = array_filter(array_map('trim', explode(',', strtoupper($raw))));
+        return array_values(array_unique($list));
+    }
+
+    /** @return float[] Weight slabs in kg to keep warm. */
+    public function warm_slabs() {
+        $raw  = (string) get_option('tis_warm_slabs', '0.5,1,1.5,2,2.5,3,4,5');
+        $list = array_filter(array_map('floatval', array_map('trim', explode(',', $raw))));
+        sort($list);
+        return array_values(array_unique($list));
+    }
+
+    /**
      * Fill in rating option defaults.
      *
      * allow_live defaults to true because the warmer and the probe both want a
@@ -454,6 +549,9 @@ abstract class TS_Provider_Base implements TS_Provider {
         return array_merge([
             'cod'        => false,
             'allow_live' => true,
+            // Declared value of the goods. Only providers whose price depends on
+            // it (iCarry's COD charge) use it; others ignore it.
+            'value'      => 0,
         ], $opts);
     }
 

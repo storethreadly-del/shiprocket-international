@@ -79,13 +79,15 @@ add_action('plugins_loaded', function () {
     require_once TIS_PATH . 'includes/providers/interface-ts-provider.php';
     require_once TIS_PATH . 'includes/providers/abstract-class-ts-provider-base.php';
     require_once TIS_PATH . 'includes/providers/class-ts-provider-shiprocket.php';
+    require_once TIS_PATH . 'includes/class-ts-icarry-credentials.php';
+    require_once TIS_PATH . 'includes/providers/class-ts-provider-icarry.php';
     require_once TIS_PATH . 'includes/class-ts-provider-registry.php';
 
     require_once TIS_PATH . 'includes/class-tis-auth.php';
     require_once TIS_PATH . 'includes/class-tis-api.php';
 
-    require_once TIS_PATH . 'includes/class-ts-icarry-credentials.php';
     require_once TIS_PATH . 'includes/class-ts-icarry-probe.php';
+    require_once TIS_PATH . 'includes/token-refresh.php';
 
     require_once TIS_PATH . 'includes/class-tis-shipping-method.php';
     require_once TIS_PATH . 'includes/rate-warmer.php';
@@ -136,4 +138,5 @@ register_activation_hook(__FILE__, function () {
 
 register_deactivation_hook(__FILE__, function () {
     wp_clear_scheduled_hook(TIS_CRON_HOOK);
+    wp_clear_scheduled_hook('tis_refresh_provider_token');
 });

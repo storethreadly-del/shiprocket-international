@@ -212,6 +212,76 @@ lockout on one side cannot block checkout on the other.
 
 ---
 
+## 7a. UPDATE: iCarry's API Document (v20.0) arrived
+
+Everything in section 7 below that says the contract is unknown is now superseded
+for the parts listed here. The document is marked *"iCarry.in Proprietary &
+Confidential"*, so it is **not committed**; this records only what the code needs.
+The provider is `includes/providers/class-ts-provider-icarry.php`, and its header
+comment states the same contract.
+
+**Documented (implemented):**
+
+- **Login:** `POST /api_login`, form fields `username` and `key`, returns an
+  `api_token` valid for **60 minutes**. The account key does not expire.
+- **Calls:** `POST /<endpoint>&api_token=<token>` with form fields. The document's
+  own sample also sends a session cookie (`OCSESSID`), so login's cookie is kept
+  with the token.
+- **Estimates:** `api_get_estimate` (domestic, pincode to pincode, modes
+  `S`/`E`/`H`, type `C`/`P`, integer cm and grams) and
+  `api_get_estimate_international` (country level). Domestic returns an object
+  keyed by courier group with `courier_cost`, `cod_cost`, `freight_cost`,
+  `rto_cost`, `gst`; international returns a list with `total`, `shipping`, `tax`.
+- **Booking** (phase 5): separate surface/air/international endpoints; takes a
+  saved `pickup_address_id`; has **`save_only`**, which stores an order without
+  booking or charging, the safe way to test; accepts `client_order_id`.
+- **Tracking:** `api_track_shipment`, plus `api_shipment_status_sync` for batches.
+- **Webhooks:** status, NDR and weight-discrepancy callbacks.
+
+**Consequences that change the plan:**
+
+1. **A 60-minute token breaks the "checkout never logs in" rule unless something
+   else logs in.** Shiprocket's 7-day token is kept warm by the daily rate warm; an
+   hourly token would leave checkout with a usable token for under an hour a day,
+   and every cold lane on the flat fallback the rest of the time, which would
+   defeat the decision to allow a bounded live call. Added `includes/token-refresh.php`:
+   a recurring job every 40 minutes for any provider that declares
+   `refresh_interval() > 0`, with the cached copy held 55 minutes so there is
+   always an overlap. It goes through the same mutex and lockout as every login.
+2. **API access can be restricted by caller IP.** The documented login error names
+   the offending IP. The server's outbound IP must be allowed in the iCarry
+   account, and **shared hosting IPs can change**, so a fixed outbound IP matters.
+   This build environment's IP will not be allowed, so live verification has to
+   run from the WordPress server (see "Verify against the live service").
+3. **No transit time or delivery date.** iCarry's estimate carries neither, so
+   iCarry rates show a price and courier only. `transit_days` and `edd` are null.
+4. **International BOOKING needs Gold or Platinum.** Rating may work on any plan;
+   booking an international shipment does not. Confirm the plan before promising
+   international fulfilment through iCarry.
+5. **The webhook authenticates by sending the account API key in the request
+   body.** A receiver must compare it in constant time and must never log
+   callback bodies, since they contain the key that also authenticates outbound
+   calls. Phase 6 treats the receiver as a secret-handling endpoint.
+
+**Still to verify against the live service** (each is isolated behind one method
+or filter and marked `VERIFY` in the provider):
+
+- whether the session cookie is required or only present in the sample;
+- whether `gst` is already inside `courier_cost` (the sample's arithmetic says it
+  is not: `courier_cost` = freight + COD charge). The default adds it, so a quote
+  cannot undercut the wallet charge, and `tis_ic_include_gst` turns it off;
+- the separator before `api_token` (the document prints `&` with no `?`);
+- the wording of an expired-token error (the auth-error match is deliberately broad).
+
+**One live login was attempted from the build environment** with the supplied
+credentials, using the documented request. It returned
+`Invalid username and key combination. Client not found.` The credentials have the
+documented shape (a short alphanumeric username, a 256-character alphanumeric
+key), so the likely causes are on the account side: the generated key was never
+**saved** in the API Credentials panel (the page's Generate button only fills the
+field in the browser), or the username is not the API username. No retry was made,
+to avoid tripping a failed-login lockout.
+
 ## 7. iCarry contract — what phase 0 established
 
 Read from iCarry's own
@@ -486,8 +556,8 @@ stream — rather than duplicating order delivery.
 | 0 | iCarry API discovery + probe harness — *endpoint set confirmed, paths/auth still blocked (§7)* | 0.5–1 d |
 | 1 | ~~Provider interface; refactor Shiprocket behind it (no behaviour change)~~ **done** | 1.5–2 d |
 | 2 | ~~Active-provider setting, switch lifecycle, admin UI~~ **done** | 1 d |
-| 3 | iCarry rate provider — international | 1–1.5 d |
-| 4 | Domestic lane: pincode cache policy, volume-based warming, COD | 1.5–2 d |
+| 3 | ~~iCarry rate provider — international~~ **done as beta, domestic included; not yet verified live (§7a)** | 1–1.5 d |
+| 4 | Domestic lane: ~~pincode cache policy, COD value slabs~~ (done with phase 3); volume-based warming and COD from the payment method still to do | 1.5–2 d |
 | 5 | Order sync: records, queue, push, idempotency | 2–3 d |
 | 6 | Tracking **via iCarry's status webhook** (§7), customer-facing display, failed-sync admin | 1.5–2 d |
 | 7 | REST read API + event contract for HIE | 1 d |

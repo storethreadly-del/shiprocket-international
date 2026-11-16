@@ -24,11 +24,13 @@ interface TS_Http {
      * @param array  $headers Header name => value.
      * @param float  $timeout Seconds.
      * @return array {
-     *     @type string|null $error Transport-level error, or null on an HTTP
-     *                              round trip that completed (even a 500).
-     *     @type int         $code  HTTP status, 0 when $error is set.
-     *     @type mixed       $body  JSON-decoded body, or null.
-     *     @type string      $raw   Undecoded body.
+     *     @type string|null $error   Transport-level error, or null on an HTTP
+     *                                round trip that completed (even a 500).
+     *     @type int         $code    HTTP status, 0 when $error is set.
+     *     @type mixed       $body    JSON-decoded body, or null.
+     *     @type string      $raw     Undecoded body.
+     *     @type array       $headers Response headers, lower-cased names.
+     *     @type array       $cookies Cookies set by the response, name => value.
      * }
      */
     public function get($url, array $headers = [], $timeout = 20);
@@ -41,6 +43,21 @@ interface TS_Http {
      * @return array Same shape as get().
      */
     public function post($url, array $headers = [], $body = null, $timeout = 20);
+
+    /**
+     * POST an application/x-www-form-urlencoded body.
+     *
+     * Some aggregators (iCarry.in) take form fields rather than JSON, including
+     * nested arrays such as boxes[0][quantity]. Passing the fields as an array
+     * and letting the transport encode them keeps that out of every provider.
+     *
+     * @param string $url
+     * @param array  $headers
+     * @param array  $fields  Field name => value; values may be nested arrays.
+     * @param float  $timeout Seconds.
+     * @return array Same shape as get().
+     */
+    public function post_form($url, array $headers = [], array $fields = [], $timeout = 20);
 }
 
 /**
@@ -63,6 +80,16 @@ class TS_Http_WP implements TS_Http {
         return $this->normalise(wp_remote_post($url, $args));
     }
 
+    public function post_form($url, array $headers = [], array $fields = [], $timeout = 20) {
+
+        $args = $this->args($headers, $timeout);
+
+        // An array body is sent as application/x-www-form-urlencoded by WP_Http.
+        $args['body'] = $fields;
+
+        return $this->normalise(wp_remote_post($url, $args));
+    }
+
     protected function args(array $headers, $timeout) {
         return [
             'headers'    => array_merge(['Accept' => 'application/json'], $headers),
@@ -80,20 +107,35 @@ class TS_Http_WP implements TS_Http {
 
         if (is_wp_error($response)) {
             return [
-                'error' => $response->get_error_message(),
-                'code'  => 0,
-                'body'  => null,
-                'raw'   => '',
+                'error'   => $response->get_error_message(),
+                'code'    => 0,
+                'body'    => null,
+                'raw'     => '',
+                'headers' => [],
+                'cookies' => [],
             ];
         }
 
         $raw = wp_remote_retrieve_body($response);
 
+        $headers = wp_remote_retrieve_headers($response);
+        $headers = (is_object($headers) && method_exists($headers, 'getAll')) ? $headers->getAll() : (array) $headers;
+        $headers = array_change_key_case($headers, CASE_LOWER);
+
+        $cookies = [];
+        foreach ((array) wp_remote_retrieve_cookies($response) as $cookie) {
+            if (is_object($cookie) && isset($cookie->name)) {
+                $cookies[(string) $cookie->name] = (string) $cookie->value;
+            }
+        }
+
         return [
-            'error' => null,
-            'code'  => (int) wp_remote_retrieve_response_code($response),
-            'body'  => json_decode($raw, true),
-            'raw'   => $raw,
+            'error'   => null,
+            'code'    => (int) wp_remote_retrieve_response_code($response),
+            'body'    => json_decode($raw, true),
+            'raw'     => $raw,
+            'headers' => $headers,
+            'cookies' => $cookies,
         ];
     }
 }

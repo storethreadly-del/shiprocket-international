@@ -404,6 +404,26 @@ fastest, most reliable, high weight discrepancy). The normalised rate row has no
 home for the RTO charge or the delivery rate. Worth adding `rto_charge` and
 `delivery_rate` in phase 3, since RTO exposure is a real cost on COD orders.
 
+### The public pincode lookup (verified live, no login)
+
+`GET https://www.icarry.in/index.php?route=checkout/ela_custom_shipping/calculate_city_state&pincode=<pin>&country_id=99`
+with `X-Requested-With: XMLHttpRequest` returns JSON with no cookie. India is
+`country_id=99`. It is the dashboard's own helper rather than the shipment API,
+so it carries no stability promise; treat it as a convenience, not a contract.
+
+- **`success` is not a validity flag.** `628001` returns the city, a `zone_id`
+  and the full list of 38 states. `000000` returns `success: 1` with an **empty
+  `city`** and `zone_id: 0`. `12345` (wrong length) returns `success: 0`. A
+  pincode pre-check must therefore test for a **non-empty `city`**, not `success`.
+- **State codes differ from WooCommerce's.** Of ten compared, seven differ:
+  Bihar (Woo `BR`, iCarry `BI`), Chhattisgarh (`CT`/`CG`), Daman and Diu
+  (`DD`/`DM`), Dadra and Nagar Haveli (`DN`/`DA`), Uttarakhand (`UT`/`UK`),
+  Odisha (`OR`/`OD`), Delhi (`DL`/`DE`). Only Chandigarh, Telangana and Tamil
+  Nadu matched. Phase 5 needs an explicit mapping table, not a pass-through; the
+  response gives iCarry's own `zone_id`s and codes to build it from.
+- It resolves a pincode to city and state, so phase 4 can fill or validate the
+  destination at checkout without a rate call.
+
 ### A finding that may shrink phase 5
 
 iCarry.in already ships a **pull-based** WooCommerce connector: you give iCarry

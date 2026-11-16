@@ -347,6 +347,31 @@ checked (breaking the host check, the redaction, or the lockout each fails tests
 - **Lockout protection.** Three consecutive 401/403s pause the probe for 15
   minutes, since a failed-login lockout is per account. Success resets the count.
 
+### What a live probe from the build session established
+
+Run with the real credentials (supplied via environment variables, never printed).
+
+- **iCarry.in is an OpenCart application.** The "API key" is generated in the
+  browser (a 256-character random string filled by a *Generate* button on the API
+  Credentials panel), which is exactly OpenCart's API-user form: a username plus a
+  generated key.
+- **The dashboard panels are session-based, not the REST API.** Every `_inner`
+  route (`account/ela_estimate_inner`, `ela_estimate_international_inner`,
+  `ela_shipment_inner`, `ela_pickup_address_inner`, ...) redirects to `/login`
+  without a browser session. The estimate forms post `sender_pincode` and
+  `receiver_pincode`, which at least confirms pincode-level domestic rating.
+- **One authenticated attempt was made, and it was a miss.** OpenCart 3's standard
+  handshake, `POST index.php?route=api/login` with `username` and `key`, returned
+  **404** (route does not exist) rather than an auth rejection, so it should not
+  have counted toward any lockout. The proxy-injected Basic header was also sent.
+- **Still unknown:** where the REST API actually lives, and how it authenticates.
+  Nothing public reveals it.
+
+**Best next evidence:** the dashboard says every booking on the website uses the
+published API, so the requests the dashboard itself makes are the contract. Capture
+one (browser DevTools > Network > "Copy as cURL", with the cookie and key removed)
+while pressing *Get Estimate*, and one while booking.
+
 ### A finding that may shrink phase 5
 
 iCarry.in already ships a **pull-based** WooCommerce connector: you give iCarry

@@ -210,7 +210,7 @@ Until step 3, every estimate below is provisional.
 |-------|------|------|
 | 0 | iCarry API discovery + probe harness | 0.5–1 d |
 | 1 | ~~Provider interface; refactor Shiprocket behind it (no behaviour change)~~ **done** | 1.5–2 d |
-| 2 | Active-provider setting, switch lifecycle, admin UI | 1 d |
+| 2 | ~~Active-provider setting, switch lifecycle, admin UI~~ **done** | 1 d |
 | 3 | iCarry rate provider — international | 1–1.5 d |
 | 4 | Domestic lane: pincode cache policy, volume-based warming, COD | 1.5–2 d |
 | 5 | Order sync: records, queue, push, idempotency | 2–3 d |
@@ -266,14 +266,71 @@ That the harness needs no WordPress is itself the check on seam 3 of §6: if a
 provider ever picks up a framework dependency, this is where it surfaces.
 
 **Seam left open.** Storage is still WordPress-native (`get_transient`,
-`get_option`). Every read and write funnels through four methods on
-`TS_Provider_Base` (`cache_get`, `cache_set`, `state_get`, `state_set`), so
-abstracting it later is a change to those four rather than a hunt through the
-class. HTTP and logging are already injected.
+`get_option`). Every read and write funnels through the five storage primitives
+at the foot of `TS_Provider_Base`, so abstracting it later is a change to those
+five rather than a hunt through the class. HTTP and logging are already injected.
 
 ---
 
-## 10. Risks
+## 10. Phase 2 as built
+
+`TS_Provider_Registry::activate($id)` is the whole switch lifecycle, and the
+settings screen drives it. In order: refuse an unregistered target, store the new
+id, stand the outgoing provider down, bring the warm cron forward, fire
+`ts_provider_switched`.
+
+**Standing the outgoing provider down** drops its rate cache, its token and its
+circuit-breaker state, and deliberately keeps its credentials, so switching back
+needs no re-entry.
+
+**Bringing the cron forward** matters more than it looks. The warm event is
+daily; without rescheduling, a switch would leave the incoming provider on a cold
+cache — and therefore checkout on fallback rates — for up to 24 hours.
+
+**Guard rails:**
+
+- An unregistered target is refused outright rather than applied; a typo cannot
+  leave the store with no provider.
+- Re-selecting the active provider is a no-op, not a destructive re-apply — in
+  particular it does not flush a warm cache.
+- Switching to a provider with no credentials is allowed but warns, naming the
+  consequence (checkout falls back).
+- A `ts_active_provider` filter outranks the stored option, so a forced override
+  would silently undo the operator's choice. `activate()` detects that the
+  effective provider is not the one just chosen and says so.
+
+**Admin UI.** A table of registered aggregators with capabilities, credential
+state and which is active, as radio buttons — one selection, so mutual exclusion
+is visible rather than merely enforced. The switch is gated behind a JS
+confirmation because it changes live checkout pricing. With one provider
+registered there is nothing to switch to, so the button is replaced by a note
+saying so. Status notices now name the active aggregator instead of hardcoding
+"Shiprocket".
+
+Credential fields are still Shiprocket-specific; iCarry's belong with the iCarry
+provider in phase 3.
+
+**Verification.** `tests/run.sh` runs both harnesses and a syntax sweep.
+`tests/smoke-provider.php` grew to 128 checks, covering the lifecycle against a
+stand-in second provider (`tests/class-ts-provider-fake.php`, which declares
+domestic + international + order_sync — without it the lifecycle would ship
+unexercised, since only one real provider exists until phase 3). It pins: the
+outgoing provider's cache, token and breaker are cleared while its credentials
+survive; the cron is brought forward; `ts_provider_switched` fires once with
+`($from, $to)`; an unknown target changes nothing; a no-op switch flushes nothing;
+and the filter-override warning fires.
+
+`tests/smoke-settings-page.php` (37 checks) renders the screen headlessly with
+**every PHP notice and warning promoted to a failure**, since a template is
+exactly the kind of code that lints clean and then breaks at runtime on an
+undefined variable. It asserts one radio per provider, exactly one preselected,
+the switch button appearing only when there is somewhere to switch to, the
+confirmation being wired up, that the stored password is never echoed back, and
+that notices follow the active provider.
+
+---
+
+## 11. Risks
 
 - **iCarry contract unknown.** Biggest unknown; phase 0 exists to retire it.
 - **Domestic cache cannot be fully warmed.** Mitigated by top-N warming + a bounded

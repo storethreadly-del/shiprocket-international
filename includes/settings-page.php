@@ -67,6 +67,38 @@ function tis_handle_settings_post(&$probe) {
         return '<div class="notice notice-success is-dismissible"><p>' . esc_html__('Settings saved.', 'threadly-intl-shipping') . '</p></div>';
     }
 
+    if ('switch_provider' === $action) {
+
+        $target = sanitize_key(wp_unslash($_POST['ts_provider'] ?? ''));
+        $result = TS_Provider_Registry::activate($target);
+
+        if (empty($result['ok'])) {
+            return '<div class="notice notice-error"><p>' . esc_html($result['error']) . '</p></div>';
+        }
+
+        if (empty($result['changed'])) {
+            return '<div class="notice notice-info is-dismissible"><p>'
+                . esc_html__('That aggregator was already active — nothing changed.', 'threadly-intl-shipping')
+                . '</p></div>';
+        }
+
+        $from = TS_Provider_Registry::get($result['from']);
+        $to   = TS_Provider_Registry::get($result['to']);
+
+        $out = '<div class="notice notice-success is-dismissible"><p>' . sprintf(
+            /* translators: 1: previous aggregator, 2: new aggregator */
+            esc_html__('Switched from %1$s to %2$s. The previous aggregator\'s cached rates and token were cleared; its credentials were kept. A rate warm has been scheduled to run shortly.', 'threadly-intl-shipping'),
+            '<strong>' . esc_html($from ? $from->label() : $result['from']) . '</strong>',
+            '<strong>' . esc_html($to ? $to->label() : $result['to']) . '</strong>'
+        ) . '</p>';
+
+        foreach ($result['warnings'] as $warning) {
+            $out .= '<p><em>' . esc_html($warning) . '</em></p>';
+        }
+
+        return $out . '</div>';
+    }
+
     if ('clear_credentials' === $action) {
         delete_option('tis_sr_password');
         $provider->forget_token();
@@ -164,31 +196,44 @@ function tis_render_settings_page() {
 
     ?>
     <div class="wrap">
-        <h1><?php esc_html_e('International Shipping (Shiprocket X)', 'threadly-intl-shipping'); ?></h1>
+        <h1><?php esc_html_e('Threadly Shipping', 'threadly-intl-shipping'); ?></h1>
 
         <?php echo $notice; // Escaped at construction. ?>
 
         <?php if (!$status['configured']) : ?>
             <div class="notice notice-warning">
-                <p><?php esc_html_e('No Shiprocket API user configured. Add one below — a dedicated API user for this plugin, separate from any other Shiprocket integration on the account, is recommended so a login failure here cannot lock out anything else and vice versa.', 'threadly-intl-shipping'); ?></p>
+                <p><?php printf(
+                    /* translators: %s: aggregator label */
+                    esc_html__('No %s API user configured. Add one below — a dedicated API user for this plugin, separate from any other integration on that account, is recommended so a login failure here cannot lock out anything else and vice versa.', 'threadly-intl-shipping'),
+                    esc_html($provider->label())
+                ); ?></p>
             </div>
         <?php elseif ($status['blocked_for'] > 0) : ?>
             <div class="notice notice-error">
                 <p><?php
                     printf(
-                        /* translators: %s: minutes remaining */
-                        esc_html__('Shiprocket login is paused after repeated failures. Retrying automatically in %s minute(s). Check the API user credentials below.', 'threadly-intl-shipping'),
+                        /* translators: 1: aggregator label, 2: minutes remaining */
+                        esc_html__('%1$s login is paused after repeated failures. Retrying automatically in %2$s minute(s). Check the API user credentials below.', 'threadly-intl-shipping'),
+                        esc_html($provider->label()),
                         esc_html((string) ceil($status['blocked_for'] / MINUTE_IN_SECONDS))
                     );
                 ?></p>
             </div>
         <?php elseif (!$status['has_token']) : ?>
             <div class="notice notice-info">
-                <p><?php esc_html_e('No warm Shiprocket token is cached right now. Checkout will serve cached or fallback rates until the next warm runs — by design, it never performs a blocking login while a customer waits. Click "Warm rate cache now" to log in immediately.', 'threadly-intl-shipping'); ?></p>
+                <p><?php printf(
+                    /* translators: %s: aggregator label */
+                    esc_html__('No warm %s token is cached right now. Checkout will serve cached or fallback rates until the next warm runs — by design, it never performs a blocking login while a customer waits. Click "Warm rate cache now" to log in immediately.', 'threadly-intl-shipping'),
+                    esc_html($provider->label())
+                ); ?></p>
             </div>
         <?php else : ?>
             <div class="notice notice-success">
-                <p><?php esc_html_e('Shiprocket authentication is healthy — a valid token is cached.', 'threadly-intl-shipping'); ?>
+                <p><?php printf(
+                    /* translators: %s: aggregator label */
+                    esc_html__('%s authentication is healthy — a valid token is cached.', 'threadly-intl-shipping'),
+                    esc_html($provider->label())
+                ); ?>
                 <?php if ('wp-config' === $status['source']) : ?>
                     <?php esc_html_e('Credentials are sourced from wp-config.php constants.', 'threadly-intl-shipping'); ?>
                 <?php endif; ?>
@@ -201,6 +246,112 @@ function tis_render_settings_page() {
                 <p><?php esc_html_e('The rate-fetch circuit breaker is currently open — live calls are paused after a failure. Cached and fallback rates are still being served. Running a warm below will reset it.', 'threadly-intl-shipping'); ?></p>
             </div>
         <?php endif; ?>
+
+        <h2><?php esc_html_e('Shipping aggregator', 'threadly-intl-shipping'); ?></h2>
+
+        <?php
+        $all       = TS_Provider_Registry::all();
+        $active_id = $provider->id();
+        ?>
+
+        <p class="description" style="max-width:70em">
+            <?php esc_html_e('Exactly one aggregator serves rates at a time. Selecting one deactivates the other — there is no state in which both quote at checkout, so an order can never be ambiguous about which dashboard it belongs to.', 'threadly-intl-shipping'); ?>
+        </p>
+
+        <form method="post" onsubmit="return tsConfirmSwitch(this);">
+            <?php wp_nonce_field('tis_settings'); ?>
+
+            <table class="widefat" style="max-width:70em;margin-top:1em">
+                <thead>
+                    <tr>
+                        <th style="width:40px"></th>
+                        <th><?php esc_html_e('Aggregator', 'threadly-intl-shipping'); ?></th>
+                        <th><?php esc_html_e('Serves', 'threadly-intl-shipping'); ?></th>
+                        <th><?php esc_html_e('Credentials', 'threadly-intl-shipping'); ?></th>
+                        <th><?php esc_html_e('Status', 'threadly-intl-shipping'); ?></th>
+                    </tr>
+                </thead>
+                <tbody>
+                <?php foreach ($all as $pid => $p) : ?>
+                    <?php
+                    $caps  = $p->capabilities();
+                    $serves = [];
+                    if (!empty($caps['domestic'])) {
+                        $serves[] = __('Domestic', 'threadly-intl-shipping');
+                    }
+                    if (!empty($caps['international'])) {
+                        $serves[] = __('International', 'threadly-intl-shipping');
+                    }
+                    $is_active = ($pid === $active_id);
+                    ?>
+                    <tr>
+                        <td>
+                            <input type="radio" name="ts_provider" id="ts_provider_<?php echo esc_attr($pid); ?>"
+                                   value="<?php echo esc_attr($pid); ?>"
+                                   data-label="<?php echo esc_attr($p->label()); ?>"
+                                   <?php checked($is_active); ?>>
+                        </td>
+                        <td>
+                            <label for="ts_provider_<?php echo esc_attr($pid); ?>">
+                                <strong><?php echo esc_html($p->label()); ?></strong>
+                            </label>
+                            <?php if (!empty($caps['order_sync'])) : ?>
+                                <br><span class="description"><?php esc_html_e('Supports order sync', 'threadly-intl-shipping'); ?></span>
+                            <?php endif; ?>
+                        </td>
+                        <td><?php echo esc_html($serves ? implode(' + ', $serves) : __('Nothing configured', 'threadly-intl-shipping')); ?></td>
+                        <td>
+                            <?php if ($p->has_credentials()) : ?>
+                                <span style="color:#1a7f37">&#10003; <?php esc_html_e('Configured', 'threadly-intl-shipping'); ?></span>
+                            <?php else : ?>
+                                <span style="color:#b32d2e">&#10007; <?php esc_html_e('Not configured', 'threadly-intl-shipping'); ?></span>
+                            <?php endif; ?>
+                        </td>
+                        <td>
+                            <?php if ($is_active) : ?>
+                                <strong><?php esc_html_e('Active', 'threadly-intl-shipping'); ?></strong>
+                            <?php else : ?>
+                                <span class="description"><?php esc_html_e('Inactive', 'threadly-intl-shipping'); ?></span>
+                            <?php endif; ?>
+                        </td>
+                    </tr>
+                <?php endforeach; ?>
+                </tbody>
+            </table>
+
+            <?php if (count($all) < 2) : ?>
+                <p class="description" style="margin-top:1em">
+                    <?php esc_html_e('Only one aggregator is available in this build, so there is nothing to switch to yet. The iCarry provider — which adds domestic Indian lanes and order sync — is not implemented yet.', 'threadly-intl-shipping'); ?>
+                </p>
+            <?php else : ?>
+                <p style="margin-top:1em">
+                    <button type="submit" name="tis_action" value="switch_provider" class="button button-primary">
+                        <?php esc_html_e('Switch aggregator', 'threadly-intl-shipping'); ?>
+                    </button>
+                    <span class="description" style="margin-left:8px">
+                        <?php esc_html_e('Changes what customers are quoted immediately. The outgoing aggregator\'s cached rates and token are cleared; its credentials are kept, so switching back needs no re-entry.', 'threadly-intl-shipping'); ?>
+                    </span>
+                </p>
+            <?php endif; ?>
+        </form>
+
+        <script>
+        /* A switch changes live checkout pricing, so make it deliberate. */
+        function tsConfirmSwitch(form) {
+            var checked = form.querySelector('input[name="ts_provider"]:checked');
+            if (!checked) {
+                return false;
+            }
+            if (checked.value === <?php echo wp_json_encode($active_id); ?>) {
+                return true;
+            }
+            return window.confirm(
+                <?php echo wp_json_encode(__('Switch the active shipping aggregator to', 'threadly-intl-shipping')); ?>
+                + ' "' + checked.getAttribute('data-label') + '"?\n\n'
+                + <?php echo wp_json_encode(__('This changes the rates customers are quoted at checkout straight away, and clears the current aggregator\'s cached rates.', 'threadly-intl-shipping')); ?>
+            );
+        }
+        </script>
 
         <h2><?php esc_html_e('Diagnostics', 'threadly-intl-shipping'); ?></h2>
         <table class="widefat" style="max-width:70em">

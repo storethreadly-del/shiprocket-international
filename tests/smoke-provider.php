@@ -26,6 +26,7 @@ require $root . '/includes/providers/class-ts-provider-shiprocket.php';
 require $root . '/includes/class-ts-provider-registry.php';
 require $root . '/includes/class-tis-auth.php';
 require $root . '/includes/class-tis-api.php';
+require __DIR__ . '/class-ts-provider-fake.php';
 
 $pass = 0;
 $fail = 0;
@@ -57,7 +58,7 @@ function v020_cache_key($pickup, $country, $weight, $cod) {
 }
 
 $http     = new TS_Http_Fake();
-$provider = new TS_Provider_Shiprocket($http, new TS_Logger_Null());
+$provider = new TS_Provider_Shiprocket_Test($http, new TS_Logger_Null());
 
 // Install it before anything can boot the real one, so that every path —
 // including the deprecated shims, which resolve through the registry — is
@@ -113,7 +114,7 @@ is_same(
 
 section('Legacy storage keys are preserved');
 
-$reflect = new ReflectionMethod('TS_Provider_Shiprocket', 'key');
+$reflect = new ReflectionMethod('TS_Provider_Shiprocket_Test', 'key');
 $reflect->setAccessible(true);
 foreach ([
     'token'        => 'tis_sr_token',
@@ -177,7 +178,7 @@ is_same('and no HTTP call was made at all', count($http->requests), $before);
 
 section('Rate URL construction');
 
-$url_method = new ReflectionMethod('TS_Provider_Shiprocket', 'rate_url');
+$url_method = new ReflectionMethod('TS_Provider_Shiprocket_Test', 'rate_url');
 $url_method->setAccessible(true);
 $url = $url_method->invoke($provider, ['country' => 'US', 'postcode' => ''], 0.5, ['cod' => false]);
 
@@ -272,6 +273,7 @@ delete_option('ts_active_provider');
 
 add_filter('ts_active_provider', function () { return 'shiprocket'; });
 is_same('filter is honoured', TS_Provider_Registry::active_id(), 'shiprocket');
+remove_all_filters('ts_active_provider');
 
 section('Deprecated shims still work');
 
@@ -285,6 +287,113 @@ is_same('TIS_Auth::TOKEN_KEY unchanged', TIS_Auth::TOKEN_KEY, 'tis_sr_token');
 is_same('TIS_API::pickup_pincode() delegates', TIS_API::pickup_pincode(), '110001');
 ok('TIS_API::circuit_is_open() delegates', !TIS_API::circuit_is_open());
 is_same('TIS_API::parse_rates() delegates', count(TIS_API::parse_rates($payload)), 2);
+
+section('Switch lifecycle (phase 2)');
+
+$fake = new TS_Provider_Fake(new TS_Http_Fake(), new TS_Logger_Null());
+TS_Provider_Registry::register($fake);
+
+// Unknown target must be refused outright: a typo cannot be allowed to leave
+// the store with no provider at all.
+$before_id = TS_Provider_Registry::active_id();
+$result    = TS_Provider_Registry::activate('nope');
+ok('refuses an unregistered target', empty($result['ok']) && !empty($result['error']));
+is_same('and leaves the active provider alone', TS_Provider_Registry::active_id(), $before_id);
+
+// Switching to the already-active provider is a no-op, not a destructive
+// re-apply — it must not flush a warm cache.
+$provider->flushes = 0;
+$result = TS_Provider_Registry::activate('shiprocket');
+ok('no-op when already active', !empty($result['ok']) && empty($result['changed']));
+is_same('and flushes nothing', $provider->flushes, 0);
+
+// Seed state on the outgoing provider so we can watch it stand down.
+$http->push(['code' => 200, 'body' => ['token' => 'tok_outgoing']]);
+$provider->login(true);
+$provider->set_cached(['country' => 'US', 'postcode' => ''], 0.5, ['cod' => false], [['courier_name' => 'X']]);
+$trip->invoke($provider);
+
+ok('outgoing has a token before the switch', (bool) $provider->cached_token());
+ok('outgoing has a cached rate before the switch', is_array($provider->get_cached(['country' => 'US'], 0.5, ['cod' => false])));
+ok('outgoing circuit is open before the switch', $provider->circuit_is_open());
+
+$GLOBALS['_cron']    = [];
+$GLOBALS['_actions'] = [];
+$provider->flushes   = 0;
+
+$result = TS_Provider_Registry::activate('fakecarry');
+
+ok('switch applied', !empty($result['ok']) && !empty($result['changed']));
+is_same('reports where it came from', $result['from'], 'shiprocket');
+is_same('reports where it went', $result['to'], 'fakecarry');
+is_same('active provider is now the new one', TS_Provider_Registry::active_id(), 'fakecarry');
+is_same('option was persisted', get_option('ts_active_provider'), 'fakecarry');
+is_same('no warnings when the target is configured', $result['warnings'], []);
+
+is_same('outgoing rate cache was flushed', $provider->flushes, 1);
+is_same('outgoing cached rate is gone', $provider->get_cached(['country' => 'US'], 0.5, ['cod' => false]), false);
+is_same('outgoing token was dropped', $provider->cached_token(), false);
+ok('outgoing circuit was reset', !$provider->circuit_is_open());
+
+ok('outgoing credentials were KEPT (switching back needs no re-entry)', $provider->has_credentials());
+is_same('outgoing email still stored', get_option('tis_sr_email'), 'intl-api@example.test');
+
+$next = wp_next_scheduled(TIS_CRON_HOOK);
+ok('warm cron was brought forward', $next && $next <= time() + (2 * MINUTE_IN_SECONDS));
+is_same('as a daily recurrence', $GLOBALS['_cron'][TIS_CRON_HOOK]['recurrence'], 'daily');
+
+$switched = array_values(array_filter($GLOBALS['_actions'], function ($a) {
+    return 'ts_provider_switched' === $a['hook'];
+}));
+is_same('ts_provider_switched fired once', count($switched), 1);
+is_same('with ($from, $to)', $switched[0]['args'], ['shiprocket', 'fakecarry']);
+
+section('Mutual exclusion holds by construction');
+
+$active = TS_Provider_Registry::active();
+is_same('exactly one provider is active', $active->id(), 'fakecarry');
+ok('the other is simply not consulted', TS_Provider_Registry::get('shiprocket')->id() !== $active->id());
+
+section('Capability-driven serviceability changes with the provider');
+
+ok('new provider serves domestic India', $active->serves(['country' => 'IN', 'postcode' => '110001']));
+ok('previous provider still refuses it', !$provider->serves(['country' => 'IN', 'postcode' => '110001']));
+ok('both serve international', $active->serves(['country' => 'US']) && $provider->serves(['country' => 'US']));
+
+section('Pincode-level warm lanes');
+
+$lanes = $active->warm_lanes();
+ok('lanes are a bounded list, not countries x slabs', count($lanes) === 3);
+is_same('domestic lane carries a postcode', $lanes[0]['destination']['postcode'], '110001');
+ok('domestic lanes can be COD', !empty($lanes[0]['cod']));
+ok('international lane is not COD', empty($lanes[2]['cod']));
+ok('pincode is part of the cache key for a pincode-level provider',
+    $active->cache_key(['country' => 'IN', 'postcode' => '110001'], 0.5, ['cod' => false])
+    !== $active->cache_key(['country' => 'IN', 'postcode' => '400001'], 0.5, ['cod' => false]));
+
+section('Switching to a provider with no credentials warns but still applies');
+
+$fake->credentials_configured = false;
+TS_Provider_Registry::activate('shiprocket');
+$result = TS_Provider_Registry::activate('fakecarry');
+
+ok('switch still applied', !empty($result['ok']) && !empty($result['changed']));
+is_same('one warning raised', count($result['warnings']), 1);
+ok('naming the fallback consequence', false !== strpos($result['warnings'][0], 'fallback'));
+$fake->credentials_configured = true;
+
+section('A ts_active_provider filter outranking the setting is reported');
+
+TS_Provider_Registry::activate('shiprocket');
+add_filter('ts_active_provider', function () { return 'shiprocket'; });
+$result = TS_Provider_Registry::activate('fakecarry');
+
+ok('the setting was still saved', !empty($result['ok']) && 'fakecarry' === get_option('ts_active_provider'));
+ok('but the override is surfaced as a warning', (bool) array_filter($result['warnings'], function ($w) {
+    return false !== strpos($w, 'filter is forcing');
+}));
+is_same('and checkout follows the filter, not the setting', TS_Provider_Registry::active_id(), 'shiprocket');
+remove_all_filters('ts_active_provider');
 
 /* =================================================================== */
 echo "\n" . str_repeat('-', 56) . "\n";

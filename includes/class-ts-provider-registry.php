@@ -154,4 +154,137 @@ class TS_Provider_Registry {
             return $p->has_credentials();
         });
     }
+
+    /* =================================================================
+     * Switching
+     * ================================================================= */
+
+    /**
+     * Make $id the active provider and stand the outgoing one down.
+     *
+     * Switching changes what customers are quoted, so the caller is expected to
+     * have confirmed with the operator first; this method does the work and
+     * reports what happened rather than asking.
+     *
+     * What happens, in order:
+     *   1. Refuse unless the target is registered. A typo must not leave the
+     *      store with no provider.
+     *   2. Store the new id.
+     *   3. Stand the outgoing provider down: drop its rate cache, its token and
+     *      its circuit-breaker state. Credentials are deliberately LEFT INTACT
+     *      so switching back does not mean re-entering them.
+     *   4. Bring the warm cron forward, so the incoming provider's cache fills
+     *      in minutes instead of whenever the daily event next happens to run.
+     *      Without this, a switch leaves checkout on fallback rates for up to a
+     *      day.
+     *   5. Fire ts_provider_switched so other code — the HIE tool included —
+     *      can react.
+     *
+     * @param string $id Target provider id.
+     * @return array {
+     *     @type bool     $ok       Whether the switch was applied.
+     *     @type bool     $changed  False when the target was already active.
+     *     @type string   $from     Previous provider id.
+     *     @type string   $to       New provider id.
+     *     @type string   $error    Present only when $ok is false.
+     *     @type string[] $warnings Non-fatal problems the operator should see.
+     * }
+     */
+    public static function activate($id) {
+
+        self::boot();
+
+        $id = (string) $id;
+        $to = self::get($id);
+
+        if (!$to) {
+            return [
+                'ok'       => false,
+                'changed'  => false,
+                'error'    => sprintf('Unknown shipping provider "%s".', $id),
+                'warnings' => [],
+            ];
+        }
+
+        $from_id = self::active_id();
+
+        if ($from_id === $id) {
+            return [
+                'ok'       => true,
+                'changed'  => false,
+                'from'     => $from_id,
+                'to'       => $id,
+                'warnings' => [],
+            ];
+        }
+
+        $from = self::get($from_id);
+
+        update_option(self::ACTIVE_OPTION, $id);
+
+        if ($from) {
+            // Drop the outgoing provider's cached rates, token and breaker
+            // state. Its credentials stay put.
+            $from->flush_cache();
+            $from->forget_token();
+            $from->reset_circuit();
+        }
+
+        self::reschedule_warm();
+
+        $warnings = [];
+
+        if (!$to->has_credentials()) {
+            $warnings[] = sprintf(
+                '%s has no API credentials configured yet, so checkout will serve the fallback rate until they are added.',
+                $to->label()
+            );
+        }
+
+        // A filter on ts_active_provider outranks the stored option, so a
+        // forced override would silently undo what the operator just did.
+        $effective = self::active_id();
+        if ($effective !== $id) {
+            $warnings[] = sprintf(
+                'The setting was saved, but a ts_active_provider filter is forcing "%s", so that is what checkout will use.',
+                $effective
+            );
+        }
+
+        tis_log('notice', 'Active shipping provider switched.', [
+            'from'     => $from_id,
+            'to'       => $id,
+            'warnings' => $warnings,
+        ]);
+
+        /**
+         * Fires after the active provider changes.
+         *
+         * @param string $from_id Previous provider id.
+         * @param string $id      New provider id.
+         */
+        do_action('ts_provider_switched', $from_id, $id);
+
+        return [
+            'ok'       => true,
+            'changed'  => true,
+            'from'     => $from_id,
+            'to'       => $id,
+            'warnings' => $warnings,
+        ];
+    }
+
+    /**
+     * Bring the daily rate warm forward so a freshly activated provider does
+     * not sit on a cold cache until the next scheduled run.
+     */
+    protected static function reschedule_warm() {
+
+        if (!defined('TIS_CRON_HOOK')) {
+            return;
+        }
+
+        wp_clear_scheduled_hook(TIS_CRON_HOOK);
+        wp_schedule_event(time() + MINUTE_IN_SECONDS, 'daily', TIS_CRON_HOOK);
+    }
 }

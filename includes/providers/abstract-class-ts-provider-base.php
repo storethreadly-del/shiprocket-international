@@ -14,9 +14,9 @@
  * away a warm token and a warm rate cache.
  *
  * Storage itself (transients and options) is still WordPress-native here. It is
- * the one HIE seam left open after phase 1 — every read and write funnels
- * through cache_get()/cache_set()/state_get()/state_set() below, so swapping it
- * out later is a change to four methods rather than a hunt through the class.
+ * the one HIE seam left open — every read and write funnels through the five
+ * storage primitives at the foot of this class, so swapping it out later is a
+ * change to those five methods rather than a hunt through the class.
  *
  * @package Threadly_Intl_Shipping
  */
@@ -468,24 +468,10 @@ abstract class TS_Provider_Base implements TS_Provider {
 
     /**
      * Drop every cached rate for this provider.
-     *
-     * Transients have no prefix search, so this goes at the options table
-     * directly — the same approach WooCommerce itself uses to clear transient
-     * families.
      */
     public function flush_cache() {
 
-        global $wpdb;
-
-        $prefix = $this->key('cache');
-
-        $wpdb->query(
-            $wpdb->prepare(
-                "DELETE FROM {$wpdb->options} WHERE option_name LIKE %s OR option_name LIKE %s",
-                $wpdb->esc_like('_transient_' . $prefix) . '%',
-                $wpdb->esc_like('_transient_timeout_' . $prefix) . '%'
-            )
-        );
+        $this->cache_delete_prefixed($this->key('cache'));
 
         $this->logger->log('info', 'Rate cache flushed.', ['provider' => $this->id()]);
     }
@@ -542,7 +528,8 @@ abstract class TS_Provider_Base implements TS_Provider {
     }
 
     /* =================================================================
-     * Storage primitives — the remaining HIE seam (see class docblock)
+     * Storage primitives — the remaining HIE seam (see class docblock).
+     * Nothing else in this class may touch WordPress storage directly.
      * ================================================================= */
 
     protected function cache_get($key) {
@@ -563,5 +550,25 @@ abstract class TS_Provider_Base implements TS_Provider {
 
     protected function state_set($key, $value) {
         update_option($key, $value, false);
+    }
+
+    /**
+     * Delete every cache entry whose key starts with $prefix.
+     *
+     * Transients have no prefix search, so this goes at the options table
+     * directly — the same approach WooCommerce itself uses to clear transient
+     * families.
+     */
+    protected function cache_delete_prefixed($prefix) {
+
+        global $wpdb;
+
+        $wpdb->query(
+            $wpdb->prepare(
+                "DELETE FROM {$wpdb->options} WHERE option_name LIKE %s OR option_name LIKE %s",
+                $wpdb->esc_like('_transient_' . $prefix) . '%',
+                $wpdb->esc_like('_transient_timeout_' . $prefix) . '%'
+            )
+        );
     }
 }

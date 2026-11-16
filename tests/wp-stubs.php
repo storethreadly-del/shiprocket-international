@@ -19,6 +19,7 @@ define('DAY_IN_SECONDS', 86400);
 
 define('TIS_SR_API_BASE', 'https://apiv2.shiprocket.in/v1/external/');
 define('TIS_VERSION', 'test');
+define('TIS_CRON_HOOK', 'tis_warm_rates');
 
 $GLOBALS['_options']    = [];
 $GLOBALS['_transients'] = [];
@@ -35,8 +36,13 @@ function apply_filters($hook, $value) {
     }
     return $value;
 }
+function remove_all_filters($hook) {
+    unset($GLOBALS['_filters'][$hook]);
+}
 function add_action($hook, $cb, $priority = 10, $args = 1) {}
-function do_action($hook) {}
+function do_action($hook) {
+    $GLOBALS['_actions'][] = ['hook' => $hook, 'args' => array_slice(func_get_args(), 1)];
+}
 
 function get_option($k, $default = false) {
     return array_key_exists($k, $GLOBALS['_options']) ? $GLOBALS['_options'][$k] : $default;
@@ -95,4 +101,18 @@ function wp_kses($s, $allowed) { return $s; }
 
 function tis_log($level, $message, $context = []) {
     $GLOBALS['_logs'][] = [$level, $message, $context];
+}
+
+$GLOBALS['_cron']    = [];
+$GLOBALS['_actions'] = [];
+
+function wp_clear_scheduled_hook($hook, $args = []) {
+    unset($GLOBALS['_cron'][$hook]);
+}
+function wp_schedule_event($timestamp, $recurrence, $hook, $args = []) {
+    $GLOBALS['_cron'][$hook] = ['timestamp' => $timestamp, 'recurrence' => $recurrence];
+    return true;
+}
+function wp_next_scheduled($hook, $args = []) {
+    return isset($GLOBALS['_cron'][$hook]) ? $GLOBALS['_cron'][$hook]['timestamp'] : false;
 }

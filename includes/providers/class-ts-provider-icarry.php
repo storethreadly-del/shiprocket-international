@@ -154,7 +154,15 @@ class TS_Provider_ICarry extends TS_Provider_Base {
         }
 
         if (!empty($body['error'])) {
-            return ['error' => $this->scrub('iCarry rejected the login: ' . $this->flatten_error($body['error']))];
+
+            $message = $this->flatten_error($body['error']);
+
+            return [
+                'error'    => $this->scrub('iCarry rejected the login: ' . $message),
+                // A wrong username or key will keep failing; an IP restriction or an
+                // outage may not. Only the former should pause automatic logins.
+                'rejected' => (bool) preg_match('/invalid username|client not found|incorrect api key|invalid.{0,20}key/i', $message),
+            ];
         }
 
         if (empty($body['api_token'])) {

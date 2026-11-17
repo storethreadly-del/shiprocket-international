@@ -244,6 +244,37 @@ class TS_Provider_Registry {
 
         $from = self::get($from_id);
 
+        // PREFLIGHT. Never move checkout onto a provider that cannot log in: it
+        // would have no token, so every lane would take the flat fallback rate
+        // (or, for a provider that serves domestic India, charge that fallback to
+        // Indian customers). This runs before anything is changed, so a refusal
+        // leaves the store exactly as it was.
+        //
+        // The default provider is exempt. That keeps a way back that can never be
+        // blocked by an outage or a lockout, so the operator cannot be trapped on a
+        // provider that has stopped working.
+        if (self::DEFAULT_PROVIDER !== $id && $to->has_credentials()) {
+
+            $login = $to->token();
+
+            if (is_array($login) && isset($login['error'])) {
+
+                tis_log('warning', 'Provider switch refused: login failed.', ['to' => $id, 'error' => $login['error']]);
+
+                return [
+                    'ok'       => false,
+                    'changed'  => false,
+                    'error'    => sprintf(
+                        'Not switched. %s could not log in: %s Checkout was left on %s. Fix the credentials and try again.',
+                        $to->label(),
+                        $login['error'],
+                        $from ? $from->label() : $from_id
+                    ),
+                    'warnings' => [],
+                ];
+            }
+        }
+
         update_option(self::ACTIVE_OPTION, $id);
 
         if ($from) {

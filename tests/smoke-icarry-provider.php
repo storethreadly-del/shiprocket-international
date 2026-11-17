@@ -91,7 +91,7 @@ ok('no country yet', !$p->serves(['country' => '', 'postcode' => '']));
 
 section('Login follows the documented contract');
 $http->requests = []; $http->push($login_ok);
-$t = $p->login(true);
+$t = $p->login(true, true);
 ok('returns a token', is_string($t) && '' !== $t);
 $req = $http->requests[0];
 is_same('one request', count($http->requests), 1);
@@ -109,23 +109,23 @@ ok('cached for about 55 minutes (token lives 60)', $ttl > 54 * 60 && $ttl <= 55 
 section('Login failures are readable and never leak the key');
 $p->forget_token(); $p->clear_failures();
 $http->push(['code' => 200, 'body' => ['error' => 'Invalid username and key combination. Client not found.']]);
-$r = $p->login(true);
+$r = $p->login(true, true);
 ok('string error surfaced', is_array($r) && false !== strpos($r['error'], 'Client not found'));
 $http->push(['code' => 200, 'body' => ['error' => ['ip' => 'Your IP 203.0.113.9 is not allowed to access this API!', 'key' => 'Incorrect API Key']]]);
-$r = $p->login(true);
+$r = $p->login(true, true);
 ok('object error flattened', is_array($r) && false !== strpos($r['error'], 'not allowed') && false !== strpos($r['error'], 'Incorrect API Key'));
 $http->push(['code' => 200, 'body' => ['error' => 'bad key ' . KEY]]);
-$r = $p->login(true);
+$r = $p->login(true, true);
 ok('a key echoed back by the server is redacted', false === strpos(json_encode($r), KEY) && false !== strpos($r['error'], '[REDACTED]'));
 $http->push(['error' => 'connect timeout using ' . KEY]);
-$r = $p->login(true);
+$r = $p->login(true, true);
 ok('transport errors are redacted too', false === strpos(json_encode($r), KEY));
 $http->push(['code' => 200, 'body' => ['success' => 'ok']]);
-ok('a login with no token is an error', isset($p->login(true)['error']));
+ok('a login with no token is an error', isset($p->login(true, true)['error']));
 $p->clear_failures();
 
 section('Failures lock out after three, like every provider');
-for ($i = 0; $i < 3; $i++) { $http->push(['code' => 200, 'body' => ['error' => 'nope']]); $p->login(true); }
+for ($i = 0; $i < 3; $i++) { $http->push(['code' => 200, 'body' => ['error' => 'nope']]); $p->login(true, true); }
 ok('lockout active', $p->auth_status()['blocked_for'] > 0);
 $before = count($http->requests);
 $p->token();
@@ -140,7 +140,7 @@ is_same('no token -> no rates', $rows, []);
 is_same('and no HTTP call at all', count($http->requests), $before);
 
 section('Domestic estimate: request');
-$http->push($login_ok); $p->login(true);
+$http->push($login_ok); $p->login(true, true);
 $http->requests = [];
 $http->push($domestic);
 $rows = $p->rates(['country' => 'IN', 'postcode' => '628008'], 0.5, ['cod' => false]);
@@ -192,7 +192,7 @@ $flat = $p->parse_rates(['estimates' => [['courier_name' => 'X', 'courier_id' =>
 is_same('total rebuilt from parts when absent', $flat[0]['rate'], 125.0);
 
 section('Errors inside a 200 response are errors, not empty lanes');
-$p->forget_token(); $http->push($login_ok); $p->login(true);
+$p->forget_token(); $http->push($login_ok); $p->login(true, true);
 $http->push(['code' => 200, 'body' => ['error' => 'Destination pincode is not serviceable']]);
 $r = $p->request(['country' => 'IN', 'postcode' => '999999'], 0.5, [], $p->cached_token(), 5);
 ok('reported as an error', !empty($r['error']) && false !== strpos($r['error'], 'not serviceable'));
@@ -201,13 +201,13 @@ ok('a non-auth error keeps the token', (bool) $p->cached_token());
 $http->push(['code' => 200, 'body' => ['error' => 'Invalid api_token']]);
 $p->request(['country' => 'IN', 'postcode' => '628008'], 0.5, [], $p->cached_token(), 5);
 is_same('an auth-looking error drops the token', $p->cached_token(), false);
-$http->push($login_ok); $p->login(true);
+$http->push($login_ok); $p->login(true, true);
 $http->push(['code' => 200, 'body' => ['success' => 1, 'error' => '', 'estimate' => []]]);
 $r = $p->request(['country' => 'IN', 'postcode' => '628008'], 0.5, [], $p->cached_token(), 5);
 ok('an empty error string with no couriers is a normal empty lane', empty($r['error']) && [] === $r['rates']);
 
 section('The token never reaches a log, a result or a diagnostic');
-$http->push($login_ok); $p->login(true);
+$http->push($login_ok); $p->login(true, true);
 $http->push($domestic);
 $r = $p->request(['country' => 'IN', 'postcode' => '628008'], 0.5, [], $p->cached_token(), 5);
 ok('returned URL carries no token', false === strpos($r['url'], TOK) && false === strpos($r['url'], 'api_token'));
@@ -219,7 +219,7 @@ ok('no log line contains the token or key', !array_filter($GLOBALS['_logs'], fun
 
 section('Multiple modes');
 update_option('tis_ic_modes', 'S,E');
-$p->forget_token(); $http->push($login_ok); $p->login(true);
+$p->forget_token(); $http->push($login_ok); $p->login(true, true);
 $http->requests = [];
 $http->push($domestic)->push(['code' => 200, 'body' => ['success' => 1, 'error' => '', 'estimate' => [
     'Alpha Air' => ['courier_name' => 'Alpha Air', 'courier_id' => '159', 'courier_cost' => '120.00', 'cod_cost' => '0', 'freight_cost' => '120.00', 'rto_cost' => '100', 'gst' => '21.60'],
@@ -345,10 +345,105 @@ ok('Shiprocket still there', TS_Provider_Registry::exists('shiprocket'));
 $before = TS_Provider_Registry::activate('icarry');
 ok('and cannot be switched to', empty($before['ok']));
 setup_creds();
-TS_Provider_Registry::register_optional_providers();
+$rh = new TS_Http_Fake();
+TS_Provider_Registry::register_optional_providers($rh);
 ok('present once credentials exist', TS_Provider_Registry::exists('icarry'));
+ok('and it is the real iCarry provider', TS_Provider_Registry::get('icarry') instanceof TS_Provider_ICarry);
+// Swap in the database-free variant for the switching tests below.
+$ic = new TS_Provider_ICarry_Test($rh, new TS_Logger_Null());
+TS_Provider_Registry::register($ic);
+$rh->push($login_ok);
 $sw = TS_Provider_Registry::activate('icarry');
-ok('then it can be activated', !empty($sw['ok']) && 'icarry' === TS_Provider_Registry::active_id());
+ok('then it can be activated, because its login succeeds', !empty($sw['ok']) && 'icarry' === TS_Provider_Registry::active_id());
+
+section('A switch is refused when the incoming provider cannot log in');
+$GLOBALS['_cron'] = [];
+$sr = TS_Provider_Registry::get('shiprocket');
+TS_Provider_Registry::activate('shiprocket');             // back to the default
+$ic->forget_token(); $ic->clear_failures();
+$sr->flushes = 0;
+$rh->requests = [];
+$rh->push(['code' => 200, 'body' => ['error' => 'Invalid username and key combination. Client not found.']]);
+$r = TS_Provider_Registry::activate('icarry');
+ok('refused', empty($r['ok']) && empty($r['changed']));
+ok('with a plain explanation', false !== strpos($r['error'], 'Not switched') && false !== strpos($r['error'], 'Client not found'));
+ok('saying checkout was left alone', false !== strpos($r['error'], 'left on'));
+is_same('checkout is still on Shiprocket', TS_Provider_Registry::active_id(), 'shiprocket');
+is_same('the stored setting was not touched', get_option('ts_active_provider'), 'shiprocket');
+is_same('the outgoing provider was NOT flushed', $sr->flushes, 0);
+ok('no refresh job was scheduled for the provider that failed', false === wp_next_scheduled(TIS_REFRESH_HOOK));
+ok('the key is not in the message', false === strpos(json_encode($r), KEY));
+ok('and the failed attempt is remembered as a rejection', $ic->credentials_rejected());
+
+section('But the way back to the default can never be blocked');
+update_option('ts_active_provider', 'icarry');
+$sr->forget_token();
+$rh2 = new TS_Http_Fake();                                // Shiprocket cannot log in either
+$sr2 = new TS_Provider_Shiprocket_Test($rh2, new TS_Logger_Null());
+update_option('tis_sr_email', 'a@b.test'); update_option('tis_sr_password', 'pw');
+TS_Provider_Registry::register($sr2);
+$rh2->push(['code' => 403, 'body' => ['message' => 'blocked']]);
+$r = TS_Provider_Registry::activate('shiprocket');
+ok('switching back to Shiprocket is allowed even if its login would fail', !empty($r['ok']) && !empty($r['changed']));
+is_same('and it took effect', TS_Provider_Registry::active_id(), 'shiprocket');
+is_same('without attempting a login to ask permission', count($rh2->requests), 0);
+
+section('A rejected credential pauses background logins');
+TS_Provider_Registry::register($ic);
+$ic->forget_token(); $ic->clear_failures();
+update_option('tis_ic_password', KEY);
+$rh->requests = [];
+$rh->push($login_ok);
+$ic->test_connection();
+ok('a successful login clears any earlier rejection', !$ic->credentials_rejected());
+$ic->forget_token(); $ic->clear_failures();
+$rh->push(['code' => 200, 'body' => ['error' => 'Invalid username and key combination. Client not found.']]);
+$r = $ic->test_connection();
+ok('the explicit check reports it', isset($r['error']));
+ok('and the credentials are now marked rejected', $ic->credentials_rejected());
+ok('visible in the auth status', true === $ic->auth_status()['rejected']);
+$before = count($rh->requests);
+$r = $ic->token();
+ok('a background login now refuses', isset($r['error']) && false !== strpos($r['error'], 'paused'));
+is_same('without calling iCarry', count($rh->requests), $before);
+tis_refresh_provider_token();
+is_same('the refresh job does not call iCarry either', count($rh->requests), $before);
+update_option('ts_active_provider', 'icarry');
+$r = $ic->login(true);
+ok('even a forced background login is refused', isset($r['error']) && false !== strpos($r['error'], 'paused'));
+delete_option('ts_active_provider');
+
+section('An operator can still retry deliberately');
+$rh->push($login_ok);
+$r = $ic->test_connection();
+ok('Test connection tries again', is_string($r) && '' !== $r);
+ok('and success clears the rejection', !$ic->credentials_rejected());
+
+section('Changing the credentials clears a rejection by itself');
+$rh->push(['code' => 200, 'body' => ['error' => 'Invalid username and key combination. Client not found.']]);
+$ic->forget_token(); $ic->clear_failures();
+$ic->test_connection();
+ok('rejected again', $ic->credentials_rejected());
+update_option('tis_ic_password', KEY . '-regenerated');
+ok('a new key is not considered rejected', !$ic->credentials_rejected());
+$before = count($rh->requests);
+$rh->push($login_ok);
+$ic->clear_failures();
+$r = $ic->token();
+ok('so the next background login goes ahead', is_string($r) && count($rh->requests) === $before + 1);
+update_option('tis_ic_password', KEY);
+
+section('Only a definitive rejection pauses logins');
+$ic->forget_token(); $ic->clear_failures();
+$rh->push(['code' => 200, 'body' => ['error' => ['ip' => 'Your IP 203.0.113.9 is not allowed to access this API!']]]);
+$ic->test_connection();
+ok('an IP restriction is not a rejected credential', !$ic->credentials_rejected());
+$rh->push(['error' => 'cURL timeout']);
+$ic->clear_failures();
+$ic->test_connection();
+ok('neither is a timeout', !$ic->credentials_rejected());
+ok('Shiprocket never marks credentials rejected', !$sr2->credentials_rejected());
+$ic->clear_failures();
 
 section('Base class change is invisible to Shiprocket');
 ok('Shiprocket still sends a GET with a Bearer header', (function () {

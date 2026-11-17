@@ -175,7 +175,30 @@ abstract class TS_Provider_Base implements TS_Provider {
             )];
         }
 
-        return $this->login(true);
+        // An explicit, operator-initiated check is allowed to try again even when
+        // the saved credentials were rejected earlier. Background jobs are not.
+        return $this->login(true, true);
+    }
+
+    /**
+     * A fingerprint of the credentials currently in use. A rejection is remembered
+     * against this, so changing the credentials clears it automatically.
+     */
+    protected function credential_fingerprint() {
+        return md5((string) wp_json_encode($this->credentials()));
+    }
+
+    /**
+     * Whether the aggregator has already said, definitively, that THESE credentials
+     * are wrong.
+     *
+     * That differs from a transient failure (a timeout, an outage), which is worth
+     * retrying. A rejected credential will keep failing, and a background job that
+     * retried it every few minutes would just hammer someone else's login endpoint
+     * with a bad password indefinitely, which is exactly how an account gets locked.
+     */
+    public function credentials_rejected() {
+        return $this->state_get($this->key('rejected')) === $this->credential_fingerprint();
     }
 
     /**
@@ -191,11 +214,18 @@ abstract class TS_Provider_Base implements TS_Provider {
      * @param bool $force Skip the cached-token short-circuit.
      * @return string|array Token string, or array with 'error'.
      */
-    public function login($force = false) {
+    public function login($force = false, $explicit = false) {
 
         if (!$this->has_credentials()) {
             return ['error' => sprintf(
                 'No %s API credentials configured. Add them under WooCommerce > Intl Shipping.',
+                $this->label()
+            )];
+        }
+
+        if (!$explicit && $this->credentials_rejected()) {
+            return ['error' => sprintf(
+                '%s rejected the saved credentials, so automatic logins are paused until they are changed. Press Test connection to try again.',
                 $this->label()
             )];
         }
@@ -227,6 +257,11 @@ abstract class TS_Provider_Base implements TS_Provider {
             $result = $this->authenticate($this->credentials());
 
             if (!empty($result['error'])) {
+
+                if (!empty($result['rejected'])) {
+                    $this->state_set($this->key('rejected'), $this->credential_fingerprint());
+                }
+
                 $this->record_failure();
                 $this->logger->log('error', 'Authentication failed.', [
                     'provider' => $this->id(),
@@ -236,6 +271,7 @@ abstract class TS_Provider_Base implements TS_Provider {
             }
 
             $this->clear_failures();
+            $this->state_set($this->key('rejected'), '');
             $this->cache_set($this->key('token'), (string) $result['token'], static::TOKEN_TTL);
             $this->logger->log('info', 'Authentication succeeded.', [
                 'provider' => $this->id(),
@@ -268,6 +304,7 @@ abstract class TS_Provider_Base implements TS_Provider {
             'has_token'   => (bool) $this->cached_token(),
             'fails'       => (int) $this->cache_get($this->key('fails')),
             'blocked_for' => $blocked > time() ? ($blocked - time()) : 0,
+            'rejected'    => $this->credentials_rejected(),
         ];
     }
 

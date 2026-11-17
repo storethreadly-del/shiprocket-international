@@ -282,6 +282,34 @@ key), so the likely causes are on the account side: the generated key was never
 field in the browser), or the username is not the API username. No retry was made,
 to avoid tripping a failed-login lockout.
 
+### 7b. Incident: checkout switched to an iCarry that could not log in
+
+The first deployment of the beta ended with iCarry as the **active** aggregator on
+the live store while its login was being rejected (`Invalid username and key
+combination. Client not found.`, from the WordPress server, so not an IP problem).
+With no token, every lane took the flat fallback. Three weaknesses were exposed;
+each is now closed and covered by tests:
+
+1. **A switch could move checkout onto a provider that cannot log in.** It only
+   warned when credentials were *missing*, not when they were *rejected*.
+   `TS_Provider_Registry::activate()` now logs in as a preflight, before changing
+   anything, and refuses on failure. The default provider (Shiprocket) is exempt,
+   so the way back can never be blocked by an outage or a lockout.
+2. **A rejected credential was retried forever.** The 15-minute failure window
+   expires before the 40-minute token refresh comes round, so the three-strikes
+   lockout never tripped: a wrong key would have been sent to iCarry's login
+   endpoint every 40 minutes indefinitely, which is how an account gets locked.
+   A definitive rejection is now remembered against a fingerprint of the
+   credentials; background logins pause until the credentials change. Pressing
+   *Test connection* still tries again deliberately. Only a definitive rejection
+   pauses logins; an IP restriction or a timeout does not.
+3. **The domestic fallback was the international one.** A provider that serves
+   India would have charged Indian customers the flat amount sized for a worst-case
+   overseas parcel (2,500 by default). Domestic now has its own fallback amount,
+   **off by default**. `calculate_shipping()` had never been exercised by any
+   harness; `tests/smoke-shipping-method.php` now covers it with a stand-in for
+   WooCommerce's `WC_Shipping_Method`.
+
 ## 7. iCarry contract — what phase 0 established
 
 Read from iCarry's own

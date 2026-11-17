@@ -104,6 +104,14 @@ add_action('woocommerce_shipping_init', function () {
                     'desc_tip'          => true,
                     'custom_attributes' => ['step' => '1', 'min' => '0'],
                 ],
+                'fallback_cost_domestic' => [
+                    'title'             => __('Domestic fallback amount', 'threadly-intl-shipping'),
+                    'type'              => 'number',
+                    'description'       => __('Charged when a rate for an Indian destination is unavailable. Separate from the international fallback above, because an amount sized for a worst-case overseas parcel would be a wildly wrong charge for a domestic one. 0 shows no rate in that case.', 'threadly-intl-shipping'),
+                    'default'           => '0',
+                    'desc_tip'          => true,
+                    'custom_attributes' => ['step' => '1', 'min' => '0'],
+                ],
                 'fallback_label' => [
                     'title'    => __('Fallback label', 'threadly-intl-shipping'),
                     'type'     => 'text',
@@ -176,13 +184,24 @@ add_action('woocommerce_shipping_init', function () {
                 return;
             }
 
-            $cost = (float) $this->get_option('fallback_cost', 0);
+            $country  = isset($package['destination']['country']) ? $package['destination']['country'] : '';
+            $home     = strtoupper((string) apply_filters('ts_home_country', 'IN'));
+            $domestic = ('' !== $country && strtoupper($country) === $home);
+
+            // The international fallback is sized to cover a worst-case overseas
+            // parcel. A provider that serves domestic India (iCarry) must never
+            // inherit that figure for Indian customers, so domestic has its own
+            // amount, off by default.
+            $cost = (float) $this->get_option($domestic ? 'fallback_cost_domestic' : 'fallback_cost', 0);
             if ($cost <= 0) {
                 return;
             }
 
-            $country = isset($package['destination']['country']) ? $package['destination']['country'] : '';
-            tis_log('notice', 'Serving fallback international rate — live Shiprocket rates unavailable.', ['country' => $country, 'fallback_cost' => $cost]);
+            tis_log('notice', 'Serving fallback rate — live rates unavailable.', [
+                'country'       => $country,
+                'domestic'      => $domestic,
+                'fallback_cost' => $cost,
+            ]);
 
             $this->add_rate([
                 'id'        => $this->get_rate_id('fallback'),
@@ -224,7 +243,11 @@ add_action('woocommerce_shipping_init', function () {
             // serves them is active (SCOPE.md §4).
             $cod = (bool) apply_filters('ts_rate_request_cod', false, $package, $provider);
 
-            $rates = $provider->rates($destination, $weight, ['cod' => $cod]);
+            $rates = $provider->rates($destination, $weight, [
+                'cod'   => $cod,
+                // Used only by a provider whose price depends on declared value.
+                'value' => isset($package['contents_cost']) ? (float) $package['contents_cost'] : 0.0,
+            ]);
 
             if (empty($rates)) {
                 $this->add_fallback_rate($package);

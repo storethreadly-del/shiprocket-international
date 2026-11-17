@@ -175,7 +175,30 @@ abstract class TS_Provider_Base implements TS_Provider {
             )];
         }
 
-        return $this->login(true);
+        // An explicit, operator-initiated check is allowed to try again even when
+        // the saved credentials were rejected earlier. Background jobs are not.
+        return $this->login(true, true);
+    }
+
+    /**
+     * A fingerprint of the credentials currently in use. A rejection is remembered
+     * against this, so changing the credentials clears it automatically.
+     */
+    protected function credential_fingerprint() {
+        return md5((string) wp_json_encode($this->credentials()));
+    }
+
+    /**
+     * Whether the aggregator has already said, definitively, that THESE credentials
+     * are wrong.
+     *
+     * That differs from a transient failure (a timeout, an outage), which is worth
+     * retrying. A rejected credential will keep failing, and a background job that
+     * retried it every few minutes would just hammer someone else's login endpoint
+     * with a bad password indefinitely, which is exactly how an account gets locked.
+     */
+    public function credentials_rejected() {
+        return $this->state_get($this->key('rejected')) === $this->credential_fingerprint();
     }
 
     /**
@@ -191,11 +214,18 @@ abstract class TS_Provider_Base implements TS_Provider {
      * @param bool $force Skip the cached-token short-circuit.
      * @return string|array Token string, or array with 'error'.
      */
-    public function login($force = false) {
+    public function login($force = false, $explicit = false) {
 
         if (!$this->has_credentials()) {
             return ['error' => sprintf(
                 'No %s API credentials configured. Add them under WooCommerce > Intl Shipping.',
+                $this->label()
+            )];
+        }
+
+        if (!$explicit && $this->credentials_rejected()) {
+            return ['error' => sprintf(
+                '%s rejected the saved credentials, so automatic logins are paused until they are changed. Press Test connection to try again.',
                 $this->label()
             )];
         }
@@ -227,6 +257,11 @@ abstract class TS_Provider_Base implements TS_Provider {
             $result = $this->authenticate($this->credentials());
 
             if (!empty($result['error'])) {
+
+                if (!empty($result['rejected'])) {
+                    $this->state_set($this->key('rejected'), $this->credential_fingerprint());
+                }
+
                 $this->record_failure();
                 $this->logger->log('error', 'Authentication failed.', [
                     'provider' => $this->id(),
@@ -236,6 +271,7 @@ abstract class TS_Provider_Base implements TS_Provider {
             }
 
             $this->clear_failures();
+            $this->state_set($this->key('rejected'), '');
             $this->cache_set($this->key('token'), (string) $result['token'], static::TOKEN_TTL);
             $this->logger->log('info', 'Authentication succeeded.', [
                 'provider' => $this->id(),
@@ -268,6 +304,7 @@ abstract class TS_Provider_Base implements TS_Provider {
             'has_token'   => (bool) $this->cached_token(),
             'fails'       => (int) $this->cache_get($this->key('fails')),
             'blocked_for' => $blocked > time() ? ($blocked - time()) : 0,
+            'rejected'    => $this->credentials_rejected(),
         ];
     }
 
@@ -402,7 +439,7 @@ abstract class TS_Provider_Base implements TS_Provider {
             return ['error' => $url['error'], 'rates' => []];
         }
 
-        $response = $this->http->get($url, ['Authorization' => 'Bearer ' . $token], $timeout);
+        $response = $this->send_rate_request($url, $token, $destination, $weight, $opts, $timeout);
 
         $log = [
             'provider'    => $this->id(),
@@ -422,6 +459,23 @@ abstract class TS_Provider_Base implements TS_Provider {
         if (401 === $code) {
             $this->forget_token();
             $this->logger->log('warning', 'Received 401 on a rate request; cached token invalidated.', $log);
+        }
+
+        // Some aggregators report failure inside a 200 response. Treat that as an
+        // error here, once, so it is never mistaken for "no couriers serve this
+        // lane" and cached as an empty result.
+        $body_error = ($code >= 200 && $code < 300) ? $this->body_error($body) : null;
+
+        if (null !== $body_error) {
+
+            if ($this->is_auth_error($body_error)) {
+                $this->forget_token();
+                $this->logger->log('warning', 'Rate request rejected as unauthenticated; cached token invalidated.', $log);
+            }
+
+            $this->logger->log('warning', 'Rate request failed.', $log + ['message' => $body_error]);
+            $this->record_error($destination, $weight, $body_error, $code);
+            return ['error' => $body_error, 'rates' => [], 'raw' => $body, 'url' => $url];
         }
 
         if ($code < 200 || $code >= 300) {
@@ -444,6 +498,84 @@ abstract class TS_Provider_Base implements TS_Provider {
     }
 
     /**
+     * Perform the HTTP call for one rate request.
+     *
+     * The default is a GET carrying the token as a Bearer header, which is what
+     * Shiprocket wants. A provider with a different transport (iCarry takes a
+     * form-encoded POST, with the token in the URL and a session cookie) overrides
+     * this and nothing else about request(), which keeps the logging, error
+     * recording, parsing and token invalidation uniform across providers.
+     *
+     * @return array A TS_Http response.
+     */
+    protected function send_rate_request($url, $token, array $destination, $weight, array $opts, $timeout) {
+        return $this->http->get($url, ['Authorization' => 'Bearer ' . $token], $timeout);
+    }
+
+    /**
+     * An error carried inside an otherwise successful (2xx) response body.
+     *
+     * @param mixed $body Decoded response.
+     * @return string|null The error message, or null when the body is not an error.
+     */
+    protected function body_error($body) {
+        return null;
+    }
+
+    /**
+     * Whether an error message means the cached token is no longer accepted, so
+     * it should be dropped and re-minted by the next background login.
+     *
+     * @param string $message
+     * @return bool
+     */
+    protected function is_auth_error($message) {
+        return false;
+    }
+
+    /**
+     * How often, in seconds, the token needs refreshing in the background; 0 for
+     * none. A provider whose token lives for days (Shiprocket) is kept warm by the
+     * daily rate warm. A short-lived one (iCarry, 60 minutes) needs a dedicated
+     * refresh, because checkout must never log in on a customer's thread and so
+     * can only use a token that a background job already minted.
+     *
+     * @return int
+     */
+    public function refresh_interval() {
+        return 0;
+    }
+
+    /**
+     * Configured pickup pincode, falling back to the WooCommerce store postcode.
+     */
+    public function pickup_pincode() {
+
+        $pin = trim((string) get_option('tis_pickup_pincode', ''));
+
+        if ('' === $pin) {
+            $pin = trim((string) get_option('woocommerce_store_postcode', ''));
+        }
+
+        return $pin;
+    }
+
+    /** @return string[] ISO-2 codes of the destination countries to keep warm. */
+    public function warm_countries() {
+        $raw  = (string) get_option('tis_warm_countries', 'US,GB,AE,AU,CA,SG');
+        $list = array_filter(array_map('trim', explode(',', strtoupper($raw))));
+        return array_values(array_unique($list));
+    }
+
+    /** @return float[] Weight slabs in kg to keep warm. */
+    public function warm_slabs() {
+        $raw  = (string) get_option('tis_warm_slabs', '0.5,1,1.5,2,2.5,3,4,5');
+        $list = array_filter(array_map('floatval', array_map('trim', explode(',', $raw))));
+        sort($list);
+        return array_values(array_unique($list));
+    }
+
+    /**
      * Fill in rating option defaults.
      *
      * allow_live defaults to true because the warmer and the probe both want a
@@ -454,6 +586,9 @@ abstract class TS_Provider_Base implements TS_Provider {
         return array_merge([
             'cod'        => false,
             'allow_live' => true,
+            // Declared value of the goods. Only providers whose price depends on
+            // it (iCarry's COD charge) use it; others ignore it.
+            'value'      => 0,
         ], $opts);
     }
 

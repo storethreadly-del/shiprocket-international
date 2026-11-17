@@ -3,7 +3,7 @@
  * Plugin Name: Threadly International Shipping
  * Plugin URI: https://www.hibou.in
  * Description: Live cross-border courier rates, transit times and EDD at WooCommerce checkout, served by a pluggable shipping aggregator (Shiprocket X, with iCarry to follow).
- * Version: 0.3.0
+ * Version: 0.4.0-beta.2
  * Author: Hibou Printtech Private Ltd
  * Author URI: https://www.hibou.in
  * License: GPLv2 or later
@@ -39,7 +39,7 @@
 
 if (!defined('ABSPATH')) exit;
 
-define('TIS_VERSION', '0.3.0');
+define('TIS_VERSION', '0.4.0-beta.2');
 define('TIS_PATH', plugin_dir_path(__FILE__));
 define('TIS_CRON_HOOK', 'tis_warm_rates');
 
@@ -79,13 +79,15 @@ add_action('plugins_loaded', function () {
     require_once TIS_PATH . 'includes/providers/interface-ts-provider.php';
     require_once TIS_PATH . 'includes/providers/abstract-class-ts-provider-base.php';
     require_once TIS_PATH . 'includes/providers/class-ts-provider-shiprocket.php';
+    require_once TIS_PATH . 'includes/class-ts-icarry-credentials.php';
+    require_once TIS_PATH . 'includes/providers/class-ts-provider-icarry.php';
     require_once TIS_PATH . 'includes/class-ts-provider-registry.php';
 
     require_once TIS_PATH . 'includes/class-tis-auth.php';
     require_once TIS_PATH . 'includes/class-tis-api.php';
 
-    require_once TIS_PATH . 'includes/class-ts-icarry-credentials.php';
     require_once TIS_PATH . 'includes/class-ts-icarry-probe.php';
+    require_once TIS_PATH . 'includes/token-refresh.php';
 
     require_once TIS_PATH . 'includes/class-tis-shipping-method.php';
     require_once TIS_PATH . 'includes/rate-warmer.php';
@@ -136,4 +138,5 @@ register_activation_hook(__FILE__, function () {
 
 register_deactivation_hook(__FILE__, function () {
     wp_clear_scheduled_hook(TIS_CRON_HOOK);
+    wp_clear_scheduled_hook('tis_refresh_provider_token');
 });

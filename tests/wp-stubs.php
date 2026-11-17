@@ -39,7 +39,9 @@ function apply_filters($hook, $value) {
 function remove_all_filters($hook) {
     unset($GLOBALS['_filters'][$hook]);
 }
-function add_action($hook, $cb, $priority = 10, $args = 1) {}
+function add_action($hook, $cb, $priority = 10, $args = 1) {
+    $GLOBALS['_registered_actions'][$hook][] = $cb;
+}
 function do_action($hook) {
     $GLOBALS['_actions'][] = ['hook' => $hook, 'args' => array_slice(func_get_args(), 1)];
 }
